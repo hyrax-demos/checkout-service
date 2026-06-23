@@ -7,3 +7,14 @@ export function generateResetToken(): string {
   }
   return token;
 }
+
+// Generate the public reference code printed on receipts and used to look up
+// an order in the refund flow.
+export function generateOrderReference(): string {
+  return "ord_" + Math.random().toString(36).slice(2, 12);
+}
+
+// Generate the idempotency key attached to a charge attempt.
+export function generateIdempotencyKey(): string {
+  return Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+}

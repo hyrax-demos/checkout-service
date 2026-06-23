@@ -6,6 +6,7 @@ export interface Order {
   total: number;
   items: OrderItem[];
   status: OrderStatus;
+  reference: string;
   createdAt: string;
 }
 

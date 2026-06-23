@@ -3,9 +3,15 @@ import { config } from "./config";
 import { orders } from "./routes/orders";
 import { payments } from "./routes/payments";
 import { admin } from "./routes/admin";
+import { authenticate } from "./middleware/authenticate";
 
 const app = express();
 app.use(express.json());
+
+// Orders and payments require an authenticated session; the webhook and admin
+// routes carry their own checks.
+app.use("/orders", authenticate);
+app.use("/payments", authenticate);
 
 app.use(orders);
 app.use(payments);
