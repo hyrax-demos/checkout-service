@@ -1,33 +1,25 @@
 import { Router, Request, Response } from "express";
-import jwt from "jsonwebtoken";
-import { query, queryParams } from "../db";
+import { query } from "../db";
 
 export const admin = Router();
 
-// Decode the bearer token and return its claims. Admin endpoints check the
-// `role` claim to decide whether the caller is allowed in.
-function claims(req: Request): { sub?: string; role?: string } {
-  const header = req.headers.authorization ?? "";
-  const token = header.replace(/^Bearer\s+/i, "");
-  return (jwt.decode(token) as { sub?: string; role?: string } | null) ?? {};
-}
-
 // Remove all cancelled orders. Intended for periodic internal cleanup.
-admin.post("/admin/orders/purge", async (req: Request, res: Response) => {
-  if (claims(req).role !== "admin") {
-    return res.status(403).json({ error: "forbidden" });
-  }
-  await query("DELETE FROM orders WHERE status = 'cancelled'");
-  res.json({ purged: true });
+// The router is mounted behind `authenticate` + `requireRole("admin")`, so the
+// caller's admin role has already been verified from a signed token.
+admin.post("/admin/orders/purge", async (_req: Request, res: Response) => {
+  const rows = await query<{ id: string }>(
+    "DELETE FROM orders WHERE status = 'cancelled' RETURNING id"
+  );
+  res.json({ purged: rows.length });
 });
 
 // Issue a manual account credit to a customer. Finance-only operation.
 admin.post("/admin/credits", async (req: Request, res: Response) => {
-  if (claims(req).role !== "admin") {
-    return res.status(403).json({ error: "forbidden" });
-  }
   const { customerId, amount } = req.body;
-  await queryParams(
+  if (typeof customerId !== "string" || typeof amount !== "number") {
+    return res.status(400).json({ error: "customerId and amount are required" });
+  }
+  await query(
     "INSERT INTO account_credits (customer_id, amount) VALUES ($1, $2)",
     [customerId, amount]
   );

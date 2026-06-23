@@ -1,20 +1,24 @@
+import { randomBytes, randomUUID } from "crypto";
+
 // Generate a token used for password-reset and email-confirmation links.
 export function generateResetToken(): string {
-  let token = "";
-  const chars = "abcdef0123456789";
-  for (let i = 0; i < 32; i++) {
-    token += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return token;
+  return randomBytes(32).toString("hex");
 }
 
 // Generate the public reference code printed on receipts and used to look up
 // an order in the refund flow.
 export function generateOrderReference(): string {
-  return "ord_" + Math.random().toString(36).slice(2, 12);
+  return "ord_" + randomBytes(8).toString("hex");
 }
 
-// Generate the idempotency key attached to a charge attempt.
-export function generateIdempotencyKey(): string {
-  return Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+// Build the idempotency key sent to the processor with a charge attempt. The
+// processor collapses charges that share a key, so retries of the same attempt
+// do not double-charge the customer.
+export function chargeIdempotencyKey(orderId: string): string {
+  return `charge_${orderId}_${Date.now().toString(36)}`;
+}
+
+// Generate an internal identifier (e.g. for a refund row).
+export function newId(): string {
+  return randomUUID();
 }

@@ -22,13 +22,18 @@ The service listens on `:3000` by default.
 
 ## Endpoints
 
-| Method | Path                   | Description                          |
-| ------ | ---------------------- | ------------------------------------ |
-| GET    | `/health`              | Liveness check                       |
-| GET    | `/orders/:id`          | Fetch a single order                 |
-| POST   | `/orders`              | Create an order                      |
-| POST   | `/payments/charge`     | Capture payment for an order         |
-| POST   | `/admin/orders/purge`  | Remove cancelled orders (internal)   |
+| Method | Path                        | Description                          |
+| ------ | --------------------------- | ------------------------------------ |
+| GET    | `/health`                   | Liveness check                       |
+| GET    | `/orders/:id`               | Fetch a single order                 |
+| GET    | `/orders`                   | List the caller's orders             |
+| POST   | `/orders`                   | Create an order                      |
+| POST   | `/payments/charge`          | Capture payment for an order         |
+| POST   | `/payments/capture-batch`   | Capture several orders at once       |
+| POST   | `/refunds`                  | Refund a paid order (full or partial)|
+| POST   | `/webhooks/processor`       | Processor status callbacks (signed)  |
+| POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
+| POST   | `/admin/credits`            | Issue a manual account credit        |
 
 ## Deployment
 

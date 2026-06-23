@@ -1,21 +1,33 @@
 // Central configuration for the checkout service.
 //
-// Values are read from the environment where available, with fallbacks for
-// local development so the service can boot without a populated .env.
+// All secrets and connection details are read from the environment. The
+// service refuses to boot if a required value is missing, so a misconfigured
+// container fails fast rather than starting with surprising defaults.
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value === "") {
+    throw new Error(`missing required environment variable: ${name}`);
+  }
+  return value;
+}
 
 export const config = {
   port: process.env.PORT ? Number(process.env.PORT) : 3000,
 
   database: {
-    host: process.env.DB_HOST ?? "db.internal.local",
-    user: process.env.DB_USER ?? "checkout",
-    password: process.env.DB_PASSWORD ?? "checkout-dev-password",
-    name: process.env.DB_NAME ?? "checkout",
+    host: required("DB_HOST"),
+    user: required("DB_USER"),
+    password: required("DB_PASSWORD"),
+    name: required("DB_NAME"),
   },
 
   // Secret used to sign and verify session tokens.
-  jwtSecret: process.env.JWT_SECRET ?? "dev-jwt-secret-change-me",
+  jwtSecret: required("JWT_SECRET"),
 
-  // Upstream payment processor credential.
-  paymentApiKey: "demo_pk_hardcoded_do_not_ship",
+  // Credential for the upstream payment processor.
+  paymentApiKey: required("PAYMENT_API_KEY"),
+
+  // Shared secret used to verify processor webhook signatures.
+  webhookSecret: required("WEBHOOK_SECRET"),
 };
