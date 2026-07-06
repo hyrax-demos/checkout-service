@@ -5,8 +5,8 @@ import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
 import { Order } from "../types";
 import {
-  chargeProcessor,
-  refundProcessor,
+  submitCharge,
+  submitRefund,
   ProcessorError,
 } from "../processor";
 
@@ -31,7 +31,7 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   try {
     // The idempotency key lets the processor collapse retries of the same
     // capture so a client that resends the request is not charged twice.
-    await chargeProcessor({
+    await submitCharge({
       amount: order.total, // cents
       card,
       apiKey: config.paymentApiKey,
@@ -77,7 +77,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   const refundId = newId();
   await withTransaction(async (client) => {
-    await refundProcessor({
+    await submitRefund({
       orderId: order.id,
       amount: amountDollars,
       apiKey: config.paymentApiKey,
@@ -110,7 +110,7 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
   const captured: string[] = [];
   await Promise.all(
     rows.map(async (order) => {
-      await chargeProcessor({
+      await submitCharge({
         amount: order.total,
         apiKey: config.paymentApiKey,
         idempotencyKey: chargeIdempotencyKey(order.id),
