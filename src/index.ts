@@ -5,6 +5,7 @@ import { payments } from "./routes/payments";
 import { admin } from "./routes/admin";
 import { webhook } from "./routes/webhook";
 import { authenticate, requireRole } from "./middleware/authenticate";
+import { requestLog } from "./middleware/requestLog";
 
 const app = express();
 
@@ -16,6 +17,7 @@ app.use(express.json());
 
 // Orders and payments require an authenticated session; admin routes
 // additionally require the `admin` role.
+app.use(requestLog);
 app.use("/orders", authenticate);
 app.use("/payments", authenticate);
 app.use("/refunds", authenticate);
