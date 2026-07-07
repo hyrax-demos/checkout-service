@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "architecture",
+  "created_at": "2026-07-07T08:51:52.621277+00:00",
+  "file": "src/routes/payments.ts",
+  "line": 18,
+  "mode": "finding",
+  "project_path": null,
+  "ref": "HYRAX-250",
+  "severity": "high",
+  "title": "Payment charge and order status update not wrapped in a transaction",
+  "tool": "database"
+}
