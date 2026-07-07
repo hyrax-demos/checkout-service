@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { query } from "../db";
+import { query, sql } from "../db";
 
 export const admin = Router();
 
@@ -8,7 +8,7 @@ export const admin = Router();
 // caller's admin role has already been verified from a signed token.
 admin.post("/admin/orders/purge", async (_req: Request, res: Response) => {
   const rows = await query<{ id: string }>(
-    "DELETE FROM orders WHERE status = 'cancelled' RETURNING id"
+    sql`DELETE FROM orders WHERE status = 'cancelled' RETURNING id`
   );
   res.json({ purged: rows.length });
 });
@@ -20,8 +20,7 @@ admin.post("/admin/credits", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "customerId and amount are required" });
   }
   await query(
-    "INSERT INTO account_credits (customer_id, amount) VALUES ($1, $2)",
-    [customerId, amount]
+    sql`INSERT INTO account_credits (customer_id, amount) VALUES (${customerId}, ${amount})`
   );
   res.json({ credited: true });
 });

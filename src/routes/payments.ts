@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { query, withTransaction } from "../db";
+import { query, sql, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -17,8 +17,7 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   const { orderId, card } = req.body;
 
   const rows = await query<Order>(
-    "SELECT id, total, status FROM orders WHERE id = $1 AND customer_id = $2",
-    [orderId, req.userId]
+    sql`SELECT id, total, status FROM orders WHERE id = ${orderId} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
@@ -37,7 +36,7 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
       apiKey: config.paymentApiKey,
       idempotencyKey: chargeIdempotencyKey(order.id),
     });
-    await query("UPDATE orders SET status = 'paid' WHERE id = $1", [order.id]);
+    await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
     res.json({ ok: true });
   } catch (e) {
     if (e instanceof ProcessorError) {
@@ -57,8 +56,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   }
 
   const rows = await query<Order>(
-    "SELECT id, total, status FROM orders WHERE reference = $1",
-    [reference]
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
   );
   const order = rows[0];
   if (!order) {
@@ -83,12 +81,11 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
       apiKey: config.paymentApiKey,
     });
     await client.query(
-      "INSERT INTO refunds (id, order_id, amount) VALUES ($1, $2, $3)",
-      [refundId, order.id, amountCents]
+      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [
-      order.id,
-    ]);
+    await client.query(
+      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+    );
   });
 
   res.json({ refunded: true, refundId, amount: amountCents });
@@ -103,8 +100,7 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
   }
 
   const rows = await query<Order>(
-    "SELECT id, total, status FROM orders WHERE id = ANY($1) AND customer_id = $2",
-    [orderIds, req.userId]
+    sql`SELECT id, total, status FROM orders WHERE id = ANY(${orderIds}) AND customer_id = ${req.userId}`
   );
 
   const captured: string[] = [];
@@ -115,7 +111,7 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
         apiKey: config.paymentApiKey,
         idempotencyKey: chargeIdempotencyKey(order.id),
       });
-      await query("UPDATE orders SET status = 'paid' WHERE id = $1", [order.id]);
+      await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
       captured.push(order.id);
     })
   ).catch(() => {
