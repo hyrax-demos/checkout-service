@@ -37,14 +37,24 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
       apiKey: config.paymentApiKey,
       idempotencyKey: chargeIdempotencyKey(order.id),
     });
-    await query("UPDATE orders SET status = 'paid' WHERE id = $1", [order.id]);
-    res.json({ ok: true });
   } catch (e) {
     if (e instanceof ProcessorError) {
       return res.status(402).json({ error: "payment declined" });
     }
     throw e;
   }
+
+  // The processor call succeeded; persist the status change atomically.
+  // If this DB write fails the client will receive a 500, and a retry will be
+  // safe because chargeIdempotencyKey deduplicates the processor request.
+  await withTransaction(async (client) => {
+    await client.query(
+      "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending'",
+      [order.id]
+    );
+  });
+
+  res.json({ ok: true });
 });
 
 // Issue a refund (full or partial) for a previously paid order, looked up by
@@ -55,6 +65,11 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
+
+  // Convert to integer cents immediately; all downstream logic (validation,
+  // processor call, DB write, response) uses only this value to prevent
+  // accidental unit mixing between the dollar input and the cents convention.
+  const amountCents = Math.round(amountDollars * 100);
 
   const rows = await query<Order>(
     "SELECT id, total, status FROM orders WHERE reference = $1",
@@ -68,20 +83,24 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
-  const amountCents = Math.round(amountDollars * 100);
-
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
+  // Issue the refund at the processor before touching the database. The
+  // external call must NOT run inside the transaction — holding a DB
+  // connection open across a network call exhausts the pool under load.
+  await refundProcessor({
+    orderId: order.id,
+    amount: amountCents,
+    apiKey: config.paymentApiKey,
+  });
+
+  // Processor confirmed the refund; persist both the refund record and the
+  // updated order status atomically so neither can succeed without the other.
   const refundId = newId();
   await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountDollars,
-      apiKey: config.paymentApiKey,
-    });
     await client.query(
       "INSERT INTO refunds (id, order_id, amount) VALUES ($1, $2, $3)",
       [refundId, order.id, amountCents]
@@ -108,20 +127,33 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
   );
 
   const captured: string[] = [];
+  const failed: string[] = [];
+
   await Promise.all(
     rows.map(async (order) => {
-      await chargeProcessor({
-        amount: order.total,
-        apiKey: config.paymentApiKey,
-        idempotencyKey: chargeIdempotencyKey(order.id),
-      });
-      await query("UPDATE orders SET status = 'paid' WHERE id = $1", [order.id]);
-      captured.push(order.id);
-    })
-  ).catch(() => {
-    // One or more captures may have failed; the per-order status updates above
-    // record which ones actually settled.
-  });
+      try {
+        // Charge the processor first; the idempotency key makes retries safe.
+        await chargeProcessor({
+          amount: order.total,
+          apiKey: config.paymentApiKey,
+          idempotencyKey: chargeIdempotencyKey(order.id),
+        });
 
-  res.json({ ok: true, captured });
+        // Persist the status change atomically once the processor confirms.
+        await withTransaction(async (client) => {
+          await client.query(
+            "UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending'",
+            [order.id]
+          );
+        });
+
+        captured.push(order.id);
+      } catch {
+        // Record which orders failed so the caller can investigate or retry.
+        failed.push(order.id);
+      }
+    })
+  );
+
+  res.json({ ok: true, captured, failed });
 });
