@@ -66,6 +66,11 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
 
+  // Convert to integer cents immediately; all downstream logic (validation,
+  // processor call, DB write, response) uses only this value to prevent
+  // accidental unit mixing between the dollar input and the cents convention.
+  const amountCents = Math.round(amountDollars * 100);
+
   const rows = await query<Order>(
     "SELECT id, total, status FROM orders WHERE reference = $1",
     [reference]
@@ -78,8 +83,6 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
-  const amountCents = Math.round(amountDollars * 100);
-
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
     return res.status(422).json({ error: "refund exceeds order total" });
@@ -90,7 +93,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   // connection open across a network call exhausts the pool under load.
   await refundProcessor({
     orderId: order.id,
-    amount: amountDollars,
+    amount: amountCents,
     apiKey: config.paymentApiKey,
   });
 
