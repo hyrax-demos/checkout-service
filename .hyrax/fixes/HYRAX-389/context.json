@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "correctness",
+  "created_at": "2026-07-21T17:26:18.012963+00:00",
+  "file": "src/utils/tokens.ts",
+  "line": 17,
+  "mode": "finding",
+  "project_path": null,
+  "ref": "HYRAX-389",
+  "severity": "critical",
+  "title": "chargeIdempotencyKey includes Date.now() \u2014 defeats idempotency, enables double charges on retry",
+  "tool": "concurrency"
+}
