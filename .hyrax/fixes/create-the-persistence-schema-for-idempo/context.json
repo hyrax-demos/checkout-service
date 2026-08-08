@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "",
+  "created_at": "2026-08-08T02:44:00.807743+00:00",
+  "file": "",
+  "line": null,
+  "mode": "directive",
+  "project_path": null,
+  "ref": "create-the-persistence-schema-for-idempo",
+  "severity": "",
+  "title": "Create the persistence schema for idempotency records as a raw SQL script (no m\u2026",
+  "tool": "task"
+}
