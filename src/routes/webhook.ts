@@ -1,6 +1,6 @@
 import { Router, Request, Response, raw } from "express";
 import { createHmac, timingSafeEqual } from "crypto";
-import { query } from "../db";
+import { query, sql } from "../db";
 import { config } from "../config";
 
 export const webhook = Router();
@@ -43,21 +43,20 @@ webhook.post(
 
     switch (event.type) {
       case "charge.succeeded":
-        await query("UPDATE orders SET status = 'paid' WHERE id = $1", [
-          event.data.orderId,
-        ]);
+        await query(
+          sql`UPDATE orders SET status = 'paid' WHERE id = ${event.data.orderId}`
+        );
         break;
       case "charge.refunded":
-        await query("UPDATE orders SET status = 'refunded' WHERE id = $1", [
-          event.data.orderId,
-        ]);
+        await query(
+          sql`UPDATE orders SET status = 'refunded' WHERE id = ${event.data.orderId}`
+        );
         break;
       case "credit.issued":
         // The processor applies a goodwill credit to the customer's balance;
         // mirror it into our account_credits ledger.
         await query(
-          "INSERT INTO account_credits (customer_id, amount) VALUES ($1, $2)",
-          [event.data.customerId, event.data.amount]
+          sql`INSERT INTO account_credits (customer_id, amount) VALUES (${event.data.customerId}, ${event.data.amount})`
         );
         break;
     }
