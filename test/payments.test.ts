@@ -175,6 +175,115 @@ describe("payments routes", () => {
     });
   });
 
+  describe("POST /refunds cumulative limit", () => {
+    // A tiny stateful fake of the orders/refunds tables, shared by the
+    // top-level `query` and the transaction client, so a refund inserted by
+    // one request is visible to the prior-total sum of the next.
+    function fakeRefundsDb(order: { id: string; total: number; status: string }) {
+      const refunds: { orderId: string; amount: number }[] = [];
+      const run = async (q: { text: string; values: unknown[] }) => {
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          refunds.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("FROM refunds")) {
+          const [orderId] = q.values as [string];
+          const sum = refunds
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          // pg returns SUM(bigint) as a string.
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("FROM orders")) {
+          return [{ ...order }];
+        }
+        return [];
+      };
+      mockedQuery.mockImplementation(run);
+      mockedWithTransaction.mockImplementation(async (fn: any) =>
+        fn({ query: vi.fn(run) })
+      );
+      return refunds;
+    }
+
+    const refund = (amountDollars: number) =>
+      request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+
+    it("allows two partial refunds that together equal the order total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const first = await refund(10.0);
+      expect(first.status).toBe(200);
+      expect(first.body.amount).toBe(1000);
+
+      const second = await refund(9.99);
+      expect(second.status).toBe(200);
+      expect(second.body.amount).toBe(999);
+
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(2);
+      expect(refunds).toEqual([
+        { orderId: "order-1", amount: 1000 },
+        { orderId: "order-1", amount: 999 },
+      ]);
+    });
+
+    it("rejects a refund that would push the cumulative total over the order total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const first = await refund(15.0);
+      expect(first.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+
+      // 1500 already refunded + 500 = 2000 > 1999.
+      const second = await refund(5.0);
+      expect(second.status).toBe(422);
+      expect(second.body).toEqual({ error: "refund exceeds order total" });
+
+      // The rejected refund never reached the processor or the refunds table.
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(refunds).toEqual([{ orderId: "order-1", amount: 1500 }]);
+    });
+
+    it("rejects over-refund caught only inside the transaction", async () => {
+      // Simulates a concurrent refund committing between the early check and
+      // the locked re-check: the pre-transaction read sees nothing, the
+      // in-transaction sum sees 1500 already refunded.
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [{ refunded: "0" }];
+      });
+      const client = {
+        query: vi.fn(async (q: { text: string }) =>
+          q.text.includes("FROM refunds") ? [{ refunded: "1500" }] : []
+        ),
+      };
+      mockedWithTransaction.mockImplementationOnce(async (fn: any) => fn(client));
+
+      const res = await refund(5.0);
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      const texts = client.query.mock.calls.map((c: any[]) => c[0].text);
+      expect(texts.some((t: string) => t.includes("INSERT INTO refunds"))).toBe(false);
+      expect(texts.some((t: string) => t.includes("UPDATE orders"))).toBe(false);
+    });
+
+    it("still rejects a single refund that exceeds the order total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const res = await refund(20.0);
+      expect(res.status).toBe(422);
+      expect(res.body).toEqual({ error: "refund exceeds order total" });
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds).toEqual([]);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)
