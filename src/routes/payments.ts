@@ -31,6 +31,12 @@ function exceedsOrderTotal(orderTotal: number, priorCents: number, amountCents: 
   return priorCents + amountCents > orderTotal;
 }
 
+// All three arguments are integer cents. True once this refund brings the
+// order's cumulative refunded total up to its captured total.
+function reachesOrderTotal(orderTotal: number, priorCents: number, amountCents: number): boolean {
+  return priorCents + amountCents >= orderTotal;
+}
+
 // Capture payment for an order against the upstream processor.
 payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   const { orderId, card } = req.body;
@@ -115,9 +121,15 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     await client.query(
       sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
+    // Only a refund that completes the order's cumulative refunded total marks
+    // it refunded; a partial refund leaves the status exactly as it was. The
+    // prior total was read under the row lock above, so exactly one refund
+    // (the one that reaches the total) performs this write.
+    if (reachesOrderTotal(order.total, prior, amountCents)) {
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+    }
     return { ok: true as const };
   });
 

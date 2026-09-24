@@ -284,6 +284,107 @@ describe("payments routes", () => {
     });
   });
 
+  describe("POST /refunds order status", () => {
+    // Stateful fake of the orders/refunds tables that also applies
+    // `UPDATE orders SET status = ...` so tests can observe the order's status
+    // after each refund, plus a log of every status write issued.
+    function fakeStatefulDb(initial: { id: string; total: number; status: string }) {
+      const order = { ...initial };
+      const refunds: { orderId: string; amount: number }[] = [];
+      const statusWrites: string[] = [];
+      const run = async (q: { text: string; values: unknown[] }) => {
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          refunds.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("FROM refunds")) {
+          const [orderId] = q.values as [string];
+          const sum = refunds
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("UPDATE orders")) {
+          const match = q.text.match(/status = '([a-z_]+)'/);
+          expect(match).not.toBeNull();
+          order.status = match![1];
+          statusWrites.push(order.status);
+          return [];
+        }
+        if (q.text.includes("FROM orders")) {
+          return [{ ...order }];
+        }
+        return [];
+      };
+      mockedQuery.mockImplementation(run);
+      mockedWithTransaction.mockImplementation(async (fn: any) =>
+        fn({ query: vi.fn(run) })
+      );
+      return { order, refunds, statusWrites };
+    }
+
+    const refund = (amountDollars: number) =>
+      request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+
+    it.each(["paid", "captured"])(
+      "leaves a %s order's status unchanged after a partial refund",
+      async (status) => {
+        const db = fakeStatefulDb({ id: "order-1", total: 1999, status });
+
+        const res = await refund(5.0);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(500);
+
+        expect(db.order.status).toBe(status);
+        // No status write at all, not even a no-op rewrite.
+        expect(db.statusWrites).toEqual([]);
+        expect(db.refunds).toEqual([{ orderId: "order-1", amount: 500 }]);
+      }
+    );
+
+    it("sets the status to refunded after a single full refund", async () => {
+      const db = fakeStatefulDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const res = await refund(19.99);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(1999);
+
+      expect(db.order.status).toBe("refunded");
+      expect(db.statusWrites).toEqual(["refunded"]);
+    });
+
+    it("sets refunded only once two partial refunds reach the total", async () => {
+      const db = fakeStatefulDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const first = await refund(10.0);
+      expect(first.status).toBe(200);
+      expect(db.order.status).toBe("paid");
+      expect(db.statusWrites).toEqual([]);
+
+      const second = await refund(9.99);
+      expect(second.status).toBe(200);
+      expect(db.order.status).toBe("refunded");
+      expect(db.statusWrites).toEqual(["refunded"]);
+      expect(db.refunds).toEqual([
+        { orderId: "order-1", amount: 1000 },
+        { orderId: "order-1", amount: 999 },
+      ]);
+    });
+
+    it("does not write a status when a refund is rejected as an over-refund", async () => {
+      const db = fakeStatefulDb({ id: "order-1", total: 1999, status: "paid" });
+
+      const res = await refund(20.0);
+      expect(res.status).toBe(422);
+      expect(db.order.status).toBe("paid");
+      expect(db.statusWrites).toEqual([]);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)
