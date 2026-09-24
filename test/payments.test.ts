@@ -11,8 +11,28 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Spy on the processor boundary so tests can assert on the exact arguments
+// (in particular, the unit of `amount`) the routes send upstream. The real
+// `ProcessorError` class is kept so `instanceof` checks in the routes work.
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { chargeProcessor, refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedChargeProcessor = chargeProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -35,6 +55,8 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedChargeProcessor.mockReset().mockResolvedValue(undefined);
+    mockedRefundProcessor.mockReset().mockResolvedValue(undefined);
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +148,69 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    function paidOrderFixture(total: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total, status: "paid" }];
+        }
+        return [];
+      });
+    }
+
+    it("sends the refund amount to the processor in integer cents", async () => {
+      paidOrderFixture(1999);
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      const args = mockedRefundProcessor.mock.calls[0][0];
+      expect(args.orderId).toBe("order-1");
+      expect(args.amount).toBe(1999);
+      expect(Number.isInteger(args.amount)).toBe(true);
+    });
+
+    it("sends a partial refund to the processor in cents, matching the stored row", async () => {
+      paidOrderFixture(5000);
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 12.5 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(1250);
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(1250);
+      const insert = client.query.mock.calls
+        .map((c: any[]) => c[0])
+        .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+      expect(insert.values).toContain(1250);
+    });
+
+    it("rounds float dollar input to whole cents before calling the processor", async () => {
+      paidOrderFixture(1000);
+      fakeTransaction();
+      // 0.29 * 100 === 28.999999999999996 in IEEE-754; must reach the
+      // processor as exactly 29.
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 0.29 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(29);
+    });
+
+    it("does not call the processor when the refund exceeds the order total", async () => {
+      paidOrderFixture(1999);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 20 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
     });
   });
 
