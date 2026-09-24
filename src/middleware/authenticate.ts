@@ -10,6 +10,26 @@ export interface AuthedRequest extends Request {
 interface SessionClaims {
   sub: string;
   role?: string;
+  exp?: unknown;
+}
+
+// Maximum clock skew (in seconds) tolerated between the API nodes and token
+// issuers/clients, for both `exp` and `nbf`.
+const MAX_CLOCK_SKEW_SECONDS = 60;
+
+// Reject a token whose `exp` is more than MAX_CLOCK_SKEW_SECONDS in the past.
+// jsonwebtoken's own check (`now >= exp + tolerance`) is off by one at the
+// boundary, so expiry is verified here instead. Tokens without `exp` pass.
+function assertNotExpired(exp: unknown): void {
+  if (typeof exp === "undefined") {
+    return;
+  }
+  if (typeof exp !== "number") {
+    throw new jwt.JsonWebTokenError("invalid exp value");
+  }
+  if (Math.floor(Date.now() / 1000) - exp > MAX_CLOCK_SKEW_SECONDS) {
+    throw new jwt.TokenExpiredError("jwt expired", new Date(exp * 1000));
+  }
 }
 
 function bearer(req: Request): string {
@@ -23,8 +43,10 @@ export function authenticate(req: AuthedRequest, res: Response, next: NextFuncti
   try {
     const payload = jwt.verify(bearer(req), config.jwtSecret, {
       algorithms: ["HS256"],
-      clockTolerance: 60 * 60 * 24,
+      clockTolerance: MAX_CLOCK_SKEW_SECONDS,
+      ignoreExpiration: true,
     }) as SessionClaims;
+    assertNotExpired(payload.exp);
     req.userId = payload.sub;
     req.role = payload.role;
     next();
