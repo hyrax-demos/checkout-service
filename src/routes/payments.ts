@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { query, sql, withTransaction } from "../db";
+import { query, sql, SqlQuery, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -11,6 +11,31 @@ import {
 } from "../processor";
 
 export const payments = Router();
+
+// Sum of every refund already recorded against an order, in integer cents.
+// An order with no refunds yet has a prior total of 0.
+async function priorRefundedCents(
+  run: (q: SqlQuery) => Promise<{ refunded: string | number | null }[]>,
+  orderId: string
+): Promise<number> {
+  const rows = await run(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${orderId}`
+  );
+  // Postgres returns SUM over integers as a bigint, which `pg` hands back as
+  // a string; normalise to a number of cents.
+  return Number(rows[0]?.refunded ?? 0);
+}
+
+// All three arguments are integer cents.
+function exceedsOrderTotal(orderTotal: number, priorCents: number, amountCents: number): boolean {
+  return priorCents + amountCents > orderTotal;
+}
+
+// All three arguments are integer cents. True once this refund brings the
+// order's cumulative refunded total up to its captured total.
+function reachesOrderTotal(orderTotal: number, priorCents: number, amountCents: number): boolean {
+  return priorCents + amountCents >= orderTotal;
+}
 
 // Capture payment for an order against the upstream processor.
 payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
@@ -68,25 +93,49 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   const amountCents = Math.round(amountDollars * 100);
 
-  // A refund may not exceed the order's captured total.
-  if (amountCents > order.total) {
+  // A refund may not push the order's cumulative refunded total (all prior
+  // refunds plus this one) past its captured total. This early check against
+  // a plain read avoids opening a transaction for an obviously-invalid
+  // request; the authoritative check is repeated under a row lock below.
+  if (exceedsOrderTotal(order.total, await priorRefundedCents(query, order.id), amountCents)) {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
+  const outcome = await withTransaction(async (client) => {
+    // Lock the order row so concurrent refunds for the same order serialize
+    // here: each one sees the refunds committed by the others before it
+    // re-sums, which prevents two in-flight refunds from jointly
+    // over-refunding the order.
+    await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
+    const prior = await priorRefundedCents((q) => client.query(q), order.id);
+    if (exceedsOrderTotal(order.total, prior, amountCents)) {
+      return { ok: false as const };
+    }
+
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents, // cents
       apiKey: config.paymentApiKey,
     });
     await client.query(
       sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
+    // Only a refund that completes the order's cumulative refunded total marks
+    // it refunded; a partial refund leaves the status exactly as it was. The
+    // prior total was read under the row lock above, so exactly one refund
+    // (the one that reaches the total) performs this write.
+    if (reachesOrderTotal(order.total, prior, amountCents)) {
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+    }
+    return { ok: true as const };
   });
+
+  if (!outcome.ok) {
+    return res.status(422).json({ error: "refund exceeds order total" });
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
