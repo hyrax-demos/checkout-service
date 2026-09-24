@@ -19,6 +19,8 @@
     "@types/jsonwebtoken": "^8.5.9",
     "@types/node": "^20.11.0",
     "@types/pg": "^8.10.9",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3",
     "vitest": "^1.2.0"
