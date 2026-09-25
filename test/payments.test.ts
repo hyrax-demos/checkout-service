@@ -167,6 +167,101 @@ describe("payments routes", () => {
     });
   });
 
+  describe("POST /refunds cumulative limit", () => {
+    // Stateful fake of the orders/refunds tables: rows inserted by one
+    // request's transaction are visible to the next request's SUM, both via
+    // `query` and via the transaction client.
+    function fakeRefundsDb(order: { id: string; total: number; status: string }) {
+      const refunds: { order_id: unknown; amount: number }[] = [];
+      const run = async (q: { text: string; values: unknown[] }) => {
+        if (q.text.includes("FROM refunds")) {
+          const orderId = q.values[0];
+          const sum = refunds
+            .filter((r) => r.order_id === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          // pg returns SUM(...) as a string.
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values;
+          refunds.push({ order_id: orderId, amount: amount as number });
+          return [];
+        }
+        if (q.text.includes("FROM orders")) {
+          return [order];
+        }
+        return [];
+      };
+      mockedQuery.mockImplementation(run);
+      mockedWithTransaction.mockImplementation(async (fn: any) =>
+        fn({ query: vi.fn(run) })
+      );
+      return refunds;
+    }
+
+    function refund(amountDollars: number) {
+      return request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+    }
+
+    it("allows a first partial refund and records it in cents", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 5000, status: "paid" });
+      const res = await refund(20);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(2000);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(refunds).toEqual([{ order_id: "order-1", amount: 2000 }]);
+    });
+
+    it("rejects a second refund that would push the cumulative total over order.total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 5000, status: "paid" });
+      expect((await refund(30)).status).toBe(200);
+      mockedRefundProcessor.mockClear();
+
+      const res = await refund(20.01);
+      expect(res.status).toBe(422);
+      expect(res.body).toEqual({ error: "refund exceeds order total" });
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds).toEqual([{ order_id: "order-1", amount: 3000 }]);
+    });
+
+    it("allows a second refund that brings the cumulative total exactly to order.total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 5000, status: "paid" });
+      expect((await refund(30)).status).toBe(200);
+      const res = await refund(20);
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(2);
+      expect(refunds.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+    });
+
+    it("still rejects a single refund above order.total", async () => {
+      const refunds = fakeRefundsDb({ id: "order-1", total: 5000, status: "paid" });
+      const res = await refund(50.01);
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds).toEqual([]);
+    });
+
+    it("re-checks under the transaction and rejects if a concurrent refund landed first", async () => {
+      fakeRefundsDb({ id: "order-1", total: 5000, status: "paid" });
+      // Pre-transaction sum sees nothing; the locked re-sum sees 4000 cents.
+      const txQuery = vi.fn(async (q: { text: string }) =>
+        q.text.includes("FROM refunds") ? [{ refunded: "4000" }] : []
+      );
+      mockedWithTransaction.mockImplementation(async (fn: any) =>
+        fn({ query: txQuery })
+      );
+      const res = await refund(20);
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(
+        txQuery.mock.calls.some(([q]) => q.text.includes("INSERT INTO refunds"))
+      ).toBe(false);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)
