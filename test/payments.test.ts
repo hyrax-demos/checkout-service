@@ -11,7 +11,17 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -126,6 +136,51 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("passes the refund amount to the processor in integer cents", () => {
+      const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+        typeof vi.fn
+      >;
+
+      beforeEach(() => {
+        mockedRefundProcessor.mockClear();
+      });
+
+      it.each([
+        [19.99, 1999],
+        [12.34, 1234],
+        [0.29, 29],
+        [5, 500],
+      ])("%s dollars -> %s cents", async (amountDollars, expectedCents) => {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          return [];
+        });
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+        expect(res.status).toBe(200);
+
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.orderId).toBe("order-1");
+        expect(args.amount).toBe(expectedCents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+
+        // The refunds row must record the same integer-cents amount.
+        const insert = client.query.mock.calls
+          .map((c: any[]) => c[0])
+          .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+        expect(insert).toBeDefined();
+        // values: [refundId, orderId, amount]
+        expect(insert.values[2]).toBe(expectedCents);
+        expect(res.body.amount).toBe(expectedCents);
+      });
     });
   });
 
