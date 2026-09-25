@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { query, sql, withTransaction } from "../db";
+import { query, sql, SqlQuery, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -46,6 +46,29 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   }
 });
 
+// Raised inside the refund transaction when the cumulative refunded total
+// would exceed the order's captured total; rolls the transaction back.
+class RefundExceedsTotalError extends Error {}
+
+// Sum of all refunds already recorded against an order, in integer cents
+// (`refunds.amount` is cents). No rows / NULL sum is 0. `pg` returns SUM of an
+// integer column as a string (bigint/numeric), so coerce to a number.
+async function priorRefundedCents(
+  run: (q: SqlQuery) => Promise<{ refunded: unknown }[]>,
+  orderId: string
+): Promise<number> {
+  const rows = await run(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${orderId}`
+  );
+  const raw = rows[0]?.refunded ?? 0;
+  const cents = Number(raw);
+  if (!Number.isFinite(cents)) {
+    // Fail closed: never let an unreadable sum authorize a refund.
+    throw new Error(`invalid refunded total for order ${orderId}`);
+  }
+  return cents;
+}
+
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
@@ -73,20 +96,53 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
+  // Cheap early rejection: if prior refunds plus this one would exceed the
+  // captured total, fail before opening a transaction or touching the
+  // processor. This is re-checked authoritatively under a row lock below.
+  const priorCents = await priorRefundedCents(query, order.id);
+  if (priorCents + amountCents > order.total) {
+    return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
+  }
+
   const refundId = newId();
-  await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountDollars,
-      apiKey: config.paymentApiKey,
+  try {
+    await withTransaction(async (client) => {
+      // Lock the order row so concurrent refunds against the same order are
+      // serialized: the read-sum-check-insert below is atomic per order.
+      await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
+      const lockedPriorCents = await priorRefundedCents(
+        (q) => client.query(q),
+        order.id
+      );
+      if (lockedPriorCents + amountCents > order.total) {
+        throw new RefundExceedsTotalError();
+      }
+
+      await refundProcessor({
+        orderId: order.id,
+        amount: amountCents, // cents, per the processor contract
+        apiKey: config.paymentApiKey,
+      });
+      await client.query(
+        sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
+      );
+      // Only a refund that brings the cumulative refunded total (cents, from
+      // the locked sum above plus this refund) up to the captured total
+      // (`order.total`, cents) marks the order refunded. A partial refund
+      // leaves the status untouched: no status write at all.
+      const refundedCents = lockedPriorCents + amountCents;
+      if (refundedCents >= order.total) {
+        await client.query(
+          sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+        );
+      }
     });
-    await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
-    );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
-  });
+  } catch (e) {
+    if (e instanceof RefundExceedsTotalError) {
+      return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
+    }
+    throw e;
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
