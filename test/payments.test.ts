@@ -186,6 +186,124 @@ describe("payments routes", () => {
         expect(res.body.amount).toBe(expectedCents);
       });
     });
+
+    describe("rejects refunds whose cumulative total would exceed the order total", () => {
+      // A tiny in-memory refunds ledger shared by the pool-level `query` mock
+      // and the transaction client, routed by SQL text. Orders' totals are in
+      // cents, as are ledger amounts.
+      type LedgerRow = { orderId: string; amount: number };
+      let ledger: LedgerRow[];
+      let txClients: { query: ReturnType<typeof vi.fn> }[];
+      const orders: Record<string, { id: string; total: number; status: string }> = {
+        ord_a: { id: "order-a", total: 5000, status: "paid" },
+        ord_b: { id: "order-b", total: 5000, status: "paid" },
+      };
+
+      function route(q: { text: string; values: unknown[] }) {
+        if (q.text.includes("FROM refunds")) {
+          const orderId = q.values[0];
+          const sum = ledger
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          // pg returns SUM() as a string.
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          ledger.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("FROM orders") && q.text.includes("reference")) {
+          const order = orders[q.values[0] as string];
+          return order ? [{ ...order }] : [];
+        }
+        return [];
+      }
+
+      beforeEach(() => {
+        ledger = [];
+        txClients = [];
+        mockedQuery.mockImplementation(async (q: any) => route(q));
+        mockedWithTransaction.mockImplementation(async (fn: any) => {
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+      });
+
+      function refund(reference: string, amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference, amountDollars });
+      }
+
+      it("rejects a second partial refund that pushes the cumulative total over", async () => {
+        const first = await refund("ord_a", 30);
+        expect(first.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+
+        const second = await refund("ord_a", 20.01);
+        expect(second.status).toBe(422);
+        expect(second.body).toEqual({ error: "refund exceeds order total" });
+        // The processor was not called again and nothing new was recorded.
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(ledger).toEqual([{ orderId: "order-a", amount: 3000 }]);
+        // No transaction was opened for the rejected refund, so the order
+        // was not touched.
+        expect(txClients).toHaveLength(1);
+      });
+
+      it("allows partial refunds that sum exactly to the order total", async () => {
+        for (const amt of [10, 15.5, 24.5]) {
+          const res = await refund("ord_a", amt);
+          expect(res.status).toBe(200);
+        }
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(3);
+        expect(ledger.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+
+        // Anything further is now over the total.
+        const extra = await refund("ord_a", 0.01);
+        expect(extra.status).toBe(422);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(3);
+      });
+
+      it("still rejects a single refund that alone exceeds the order total", async () => {
+        const res = await refund("ord_a", 50.01);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(ledger).toEqual([]);
+        expect(txClients).toHaveLength(0);
+      });
+
+      it("does not count refunds on a different order", async () => {
+        ledger.push({ orderId: "order-b", amount: 5000 });
+        const res = await refund("ord_a", 50);
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor.mock.calls[0][0].orderId).toBe("order-a");
+      });
+
+      it("re-checks under the row lock and rolls back without calling the processor", async () => {
+        // Simulate a concurrent refund landing between the fast-path check
+        // and the transaction: the ledger grows once the transaction opens.
+        mockedWithTransaction.mockImplementationOnce(async (fn: any) => {
+          ledger.push({ orderId: "order-a", amount: 4000 });
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+        const res = await refund("ord_a", 20);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        const texts = txClients[0].query.mock.calls.map((c: any[]) => c[0].text);
+        expect(texts.some((t: string) => t.includes("FOR UPDATE"))).toBe(true);
+        expect(texts.some((t: string) => t.includes("INSERT INTO refunds"))).toBe(false);
+        expect(texts.some((t: string) => t.includes("UPDATE orders"))).toBe(false);
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
