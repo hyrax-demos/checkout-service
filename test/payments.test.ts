@@ -187,6 +187,10 @@ describe("payments routes", () => {
           refunds.push({ order_id: orderId, amount: amount as number });
           return [];
         }
+        if (q.text.includes("UPDATE orders SET status = 'refunded'")) {
+          if (q.values[0] === order.id) order.status = "refunded";
+          return [];
+        }
         if (q.text.includes("FROM orders")) {
           return [order];
         }
@@ -259,6 +263,37 @@ describe("payments routes", () => {
       expect(
         txQuery.mock.calls.some(([q]) => q.text.includes("INSERT INTO refunds"))
       ).toBe(false);
+    });
+
+    describe("order status", () => {
+      it("leaves the order's status unchanged after a partial refund", async () => {
+        const order = { id: "order-1", total: 5000, status: "paid" };
+        fakeRefundsDb(order);
+        const res = await refund(20);
+        expect(res.status).toBe(200);
+        expect(order.status).toBe("paid");
+      });
+
+      it("marks the order refunded only after the partial refund that reaches order.total", async () => {
+        const order = { id: "order-1", total: 5000, status: "paid" };
+        const refunds = fakeRefundsDb(order);
+
+        expect((await refund(10)).status).toBe(200);
+        expect(order.status).toBe("paid");
+        expect((await refund(15.5)).status).toBe(200);
+        expect(order.status).toBe("paid");
+        expect((await refund(24.5)).status).toBe(200);
+        expect(refunds.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+        expect(order.status).toBe("refunded");
+      });
+
+      it("marks the order refunded after a single full refund", async () => {
+        const order = { id: "order-1", total: 1999, status: "paid" };
+        fakeRefundsDb(order);
+        const res = await refund(19.99);
+        expect(res.status).toBe(200);
+        expect(order.status).toBe("refunded");
+      });
     });
   });
 

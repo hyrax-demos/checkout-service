@@ -85,7 +85,8 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     // here, then re-sum: another refund may have committed since the check
     // above.
     await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
-    if (exceedsTotal(await priorRefundedCents((q) => client.query(q), order.id))) {
+    const priorCents = await priorRefundedCents((q) => client.query(q), order.id);
+    if (exceedsTotal(priorCents)) {
       return "exceeds_total" as const;
     }
 
@@ -97,9 +98,15 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     await client.query(
       sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
+    // Only a refund that brings the cumulative total (cents, including this
+    // one) up to the captured total marks the order refunded; a partial
+    // refund leaves the order's status as it was.
+    const cumulativeCents = priorCents + amountCents;
+    if (cumulativeCents >= order.total) {
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+    }
     return "refunded" as const;
   });
 
