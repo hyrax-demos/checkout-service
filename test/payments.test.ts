@@ -12,6 +12,7 @@ vi.mock("../src/db", () => ({
 }));
 
 import { query, withTransaction } from "../src/db";
+import * as processor from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -126,6 +127,71 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("processor amount units", () => {
+      function paidOrder(total: number) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      it.each([
+        [19.99, 1999, 1999],
+        [5, 500, 1999],
+        [0.1, 10, 1999],
+        // 0.29 * 100 === 28.999999999999996 in IEEE-754; must still be 29.
+        [0.29, 29, 1999],
+      ])(
+        "sends %s dollars to the refund processor as %s cents",
+        async (amountDollars, expectedCents, total) => {
+          const spy = vi
+            .spyOn(processor, "refundProcessor")
+            .mockResolvedValue(undefined);
+          try {
+            paidOrder(total);
+            const client = fakeTransaction();
+            const res = await request(app)
+              .post("/refunds")
+              .set("Authorization", `Bearer ${token}`)
+              .send({ reference: "ord_abc", amountDollars });
+            expect(res.status).toBe(200);
+            expect(spy).toHaveBeenCalledTimes(1);
+            const args = spy.mock.calls[0][0];
+            expect(args.orderId).toBe("order-1");
+            expect(args.amount).toBe(expectedCents);
+            expect(Number.isInteger(args.amount)).toBe(true);
+            // Processor, DB row and response must agree on the amount.
+            expect(res.body.amount).toBe(args.amount);
+            const insert = client.query.mock.calls.find(([q]: any[]) =>
+              q.text.includes("INSERT INTO refunds")
+            );
+            expect(insert?.[0].values).toContain(args.amount);
+          } finally {
+            spy.mockRestore();
+          }
+        }
+      );
+
+      it("does not call the processor when the refund exceeds the order total", async () => {
+        const spy = vi
+          .spyOn(processor, "refundProcessor")
+          .mockResolvedValue(undefined);
+        try {
+          paidOrder(1999);
+          const res = await request(app)
+            .post("/refunds")
+            .set("Authorization", `Bearer ${token}`)
+            .send({ reference: "ord_abc", amountDollars: 20 });
+          expect(res.status).toBe(422);
+          expect(spy).not.toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+      });
     });
   });
 
