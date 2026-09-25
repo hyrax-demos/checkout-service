@@ -11,11 +11,26 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Wrap the processor boundary in spies (resolving, like the demo build) so
+// tests can assert on exactly what the routes send upstream.
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +50,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +142,269 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("sends the refund amount to the processor in integer cents", () => {
+      // Order total is large enough that none of these refunds trips the
+      // over-refund check; this block is only about units.
+      function paidOrder() {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 100000, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      it.each([
+        [12.34, 1234],
+        [0.29, 29], // 0.29 * 100 === 28.999999999999996
+        [19.99, 1999], // 19.99 * 100 === 1998.9999999999998
+        [0.07, 7], // 0.07 * 100 === 7.000000000000001
+        [5, 500],
+      ])("refund of $%s -> %i cents", async (amountDollars, expectedCents) => {
+        paidOrder();
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+        expect(res.status).toBe(200);
+
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.orderId).toBe("order-1");
+        expect(args.amount).toBe(expectedCents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+
+        // The refunds ledger row records the same cents value.
+        const insert = client.query.mock.calls
+          .map((c: any[]) => c[0])
+          .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+        expect(insert).toBeDefined();
+        expect(insert.values).toContain(expectedCents);
+        expect(res.body.amount).toBe(expectedCents);
+      });
+    });
+
+    describe("rejects refunds whose cumulative total would exceed the order total", () => {
+      // A tiny in-memory refunds ledger shared by the pool-level `query` mock
+      // and the transaction client, routed by SQL text. Orders' totals are in
+      // cents, as are ledger amounts.
+      type LedgerRow = { orderId: string; amount: number };
+      let ledger: LedgerRow[];
+      let txClients: { query: ReturnType<typeof vi.fn> }[];
+      const orders: Record<string, { id: string; total: number; status: string }> = {
+        ord_a: { id: "order-a", total: 5000, status: "paid" },
+        ord_b: { id: "order-b", total: 5000, status: "paid" },
+      };
+
+      function route(q: { text: string; values: unknown[] }) {
+        if (q.text.includes("FROM refunds")) {
+          const orderId = q.values[0];
+          const sum = ledger
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          // pg returns SUM() as a string.
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          ledger.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("FROM orders") && q.text.includes("reference")) {
+          const order = orders[q.values[0] as string];
+          return order ? [{ ...order }] : [];
+        }
+        return [];
+      }
+
+      beforeEach(() => {
+        ledger = [];
+        txClients = [];
+        mockedQuery.mockImplementation(async (q: any) => route(q));
+        mockedWithTransaction.mockImplementation(async (fn: any) => {
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+      });
+
+      function refund(reference: string, amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference, amountDollars });
+      }
+
+      it("rejects a second partial refund that pushes the cumulative total over", async () => {
+        const first = await refund("ord_a", 30);
+        expect(first.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+
+        const second = await refund("ord_a", 20.01);
+        expect(second.status).toBe(422);
+        expect(second.body).toEqual({ error: "refund exceeds order total" });
+        // The processor was not called again and nothing new was recorded.
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(ledger).toEqual([{ orderId: "order-a", amount: 3000 }]);
+        // No transaction was opened for the rejected refund, so the order
+        // was not touched.
+        expect(txClients).toHaveLength(1);
+      });
+
+      it("allows partial refunds that sum exactly to the order total", async () => {
+        for (const amt of [10, 15.5, 24.5]) {
+          const res = await refund("ord_a", amt);
+          expect(res.status).toBe(200);
+        }
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(3);
+        expect(ledger.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+
+        // Anything further is now over the total.
+        const extra = await refund("ord_a", 0.01);
+        expect(extra.status).toBe(422);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(3);
+      });
+
+      it("still rejects a single refund that alone exceeds the order total", async () => {
+        const res = await refund("ord_a", 50.01);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(ledger).toEqual([]);
+        expect(txClients).toHaveLength(0);
+      });
+
+      it("does not count refunds on a different order", async () => {
+        ledger.push({ orderId: "order-b", amount: 5000 });
+        const res = await refund("ord_a", 50);
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor.mock.calls[0][0].orderId).toBe("order-a");
+      });
+
+      it("re-checks under the row lock and rolls back without calling the processor", async () => {
+        // Simulate a concurrent refund landing between the fast-path check
+        // and the transaction: the ledger grows once the transaction opens.
+        mockedWithTransaction.mockImplementationOnce(async (fn: any) => {
+          ledger.push({ orderId: "order-a", amount: 4000 });
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+        const res = await refund("ord_a", 20);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        const texts = txClients[0].query.mock.calls.map((c: any[]) => c[0].text);
+        expect(texts.some((t: string) => t.includes("FOR UPDATE"))).toBe(true);
+        expect(texts.some((t: string) => t.includes("INSERT INTO refunds"))).toBe(false);
+        expect(texts.some((t: string) => t.includes("UPDATE orders"))).toBe(false);
+      });
+    });
+
+    describe("marks the order refunded only once it is fully refunded", () => {
+      // In-memory orders + refunds ledger, routed by SQL text, shared by the
+      // pool-level `query` mock and every transaction client. Totals and
+      // ledger amounts are integer cents. Status writes are applied to the
+      // in-memory order so tests can assert on the resulting state.
+      type LedgerRow = { orderId: string; amount: number };
+      type OrderRow = { id: string; total: number; status: string; reference: string };
+      let ledger: LedgerRow[];
+      let orders: Record<string, OrderRow>;
+      let txClients: { query: ReturnType<typeof vi.fn> }[];
+
+      function route(q: { text: string; values: unknown[] }) {
+        if (q.text.includes("FROM refunds")) {
+          const orderId = q.values[0];
+          const sum = ledger
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          ledger.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("UPDATE orders")) {
+          const id = q.values[q.values.length - 1];
+          const order = Object.values(orders).find((o) => o.id === id);
+          const m = q.text.match(/status = '(\w+)'/);
+          if (order && m) order.status = m[1];
+          return [];
+        }
+        if (q.text.includes("FROM orders") && q.text.includes("reference")) {
+          const order = orders[q.values[0] as string];
+          return order
+            ? [{ id: order.id, total: order.total, status: order.status }]
+            : [];
+        }
+        return [];
+      }
+
+      beforeEach(() => {
+        ledger = [];
+        txClients = [];
+        orders = {
+          ord_a: { id: "order-a", total: 5000, status: "paid", reference: "ord_a" },
+        };
+        mockedQuery.mockImplementation(async (q: any) => route(q));
+        mockedWithTransaction.mockImplementation(async (fn: any) => {
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+      });
+
+      function refund(reference: string, amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference, amountDollars });
+      }
+
+      function orderWrites(client: { query: ReturnType<typeof vi.fn> }) {
+        return client.query.mock.calls
+          .map((c: any[]) => c[0].text as string)
+          .filter((t) => t.includes("UPDATE orders"));
+      }
+
+      it("leaves the status unchanged after a partial refund", async () => {
+        const res = await refund("ord_a", 20);
+        expect(res.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+        expect(orders.ord_a.total).toBe(5000);
+        // No write to the order row at all for a partial refund.
+        expect(orderWrites(txClients[0])).toEqual([]);
+        expect(ledger).toEqual([{ orderId: "order-a", amount: 2000 }]);
+      });
+
+      it("sets status refunded after a single full refund", async () => {
+        const res = await refund("ord_a", 50);
+        expect(res.status).toBe(200);
+        expect(orders.ord_a.status).toBe("refunded");
+        expect(orderWrites(txClients[0])).toHaveLength(1);
+      });
+
+      it("keeps status until the partial refund that reaches the total", async () => {
+        const first = await refund("ord_a", 10);
+        expect(first.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+
+        const second = await refund("ord_a", 15.5);
+        expect(second.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+
+        const third = await refund("ord_a", 24.5);
+        expect(third.status).toBe(200);
+        expect(orders.ord_a.status).toBe("refunded");
+
+        expect(txClients.map(orderWrites).map((w) => w.length)).toEqual([0, 0, 1]);
+        expect(ledger.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+      });
     });
   });
 
