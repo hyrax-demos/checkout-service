@@ -300,6 +300,90 @@ describe("payments routes", () => {
         expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
       });
     });
+
+    describe("sets the order status to refunded only once fully refunded", () => {
+      // Stateful fake of the orders + refunds tables that also applies
+      // `UPDATE orders SET status` writes, and records every status write so
+      // tests can assert that a partial refund writes no status at all.
+      function fakeOrderDb(orderTotal: number, priorRefunds: number[] = []) {
+        const state = {
+          status: "paid",
+          refunds: [...priorRefunds],
+          statusWrites: [] as { text: string; values: unknown[] }[],
+        };
+        const route = async (q: { text: string; values: unknown[] }) => {
+          if (q.text.includes("FROM refunds")) {
+            return [
+              { refunded: String(state.refunds.reduce((a, b) => a + b, 0)) },
+            ];
+          }
+          if (q.text.includes("INSERT INTO refunds")) {
+            state.refunds.push(q.values[2] as number);
+            return [];
+          }
+          if (q.text.includes("UPDATE orders SET status")) {
+            state.statusWrites.push(q);
+            if (q.text.includes("'refunded'")) state.status = "refunded";
+            return [];
+          }
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: orderTotal, status: state.status }];
+          }
+          return [];
+        };
+        mockedQuery.mockImplementation(route);
+        mockedWithTransaction.mockImplementation(async (fn: any) =>
+          fn({ query: vi.fn(route) })
+        );
+        return state;
+      }
+
+      function refund(amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+      }
+
+      it("leaves the status unchanged after a partial refund", async () => {
+        const state = fakeOrderDb(1999);
+        const res = await refund(5);
+        expect(res.status).toBe(200);
+        expect(state.refunds).toEqual([500]);
+        expect(state.status).toBe("paid");
+        expect(state.statusWrites).toEqual([]);
+      });
+
+      it("sets refunded after a single full refund", async () => {
+        const state = fakeOrderDb(1999);
+        const res = await refund(19.99);
+        expect(res.status).toBe(200);
+        expect(state.status).toBe("refunded");
+        expect(state.statusWrites).toHaveLength(1);
+        expect(state.statusWrites[0].values).toEqual(["order-1"]);
+      });
+
+      it("sets refunded only after the second of two partials reaches the total", async () => {
+        const state = fakeOrderDb(1999);
+        const first = await refund(10);
+        expect(first.status).toBe(200);
+        expect(state.status).toBe("paid");
+        expect(state.statusWrites).toEqual([]);
+
+        const second = await refund(9.99);
+        expect(second.status).toBe(200);
+        expect(state.refunds).toEqual([1000, 999]);
+        expect(state.status).toBe("refunded");
+        expect(state.statusWrites).toHaveLength(1);
+      });
+
+      it("sets refunded when a refund covers exactly the remaining amount", async () => {
+        const state = fakeOrderDb(1999, [1500]);
+        const res = await refund(4.99);
+        expect(res.status).toBe(200);
+        expect(state.status).toBe("refunded");
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
