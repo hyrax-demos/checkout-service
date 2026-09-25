@@ -192,8 +192,17 @@ describe("payments routes", () => {
         refunds.push({ id, order_id, amount });
         return [];
       }
+      if (q.text.includes("UPDATE orders SET status = 'refunded'")) {
+        statusUpdates.push(q.values[0] as string);
+        for (const o of orders) {
+          if (o.id === q.values[0]) o.status = "refunded";
+        }
+        return [];
+      }
       return [];
     }
+
+    let statusUpdates: string[];
 
     beforeEach(() => {
       orders = [
@@ -201,6 +210,7 @@ describe("payments routes", () => {
         { id: "order-2", reference: "ord_two", total: 5000, status: "paid" },
       ];
       refunds = [];
+      statusUpdates = [];
       mockedRefundProcessor.mockClear();
       mockedQuery.mockImplementation(async (q: any) => run(q));
       mockedWithTransaction.mockImplementation(async (fn: any) =>
@@ -277,6 +287,36 @@ describe("payments routes", () => {
       expect(res.status).toBe(422);
       expect(mockedRefundProcessor).not.toHaveBeenCalled();
       expect(refunds).toHaveLength(0);
+    });
+
+    it("leaves the order status unchanged after a partial refund", async () => {
+      const res = await refund("ord_one", 20);
+      expect(res.status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      // The status column is not written at all for a partial refund.
+      expect(statusUpdates).toEqual([]);
+    });
+
+    it("marks the order refunded only once partial refunds reach the total", async () => {
+      expect((await refund("ord_one", 19.99)).status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      expect((await refund("ord_one", 10.01)).status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      expect(statusUpdates).toEqual([]);
+
+      // 1999 + 1001 + 2000 = 5000 exactly.
+      expect((await refund("ord_one", 20)).status).toBe(200);
+      expect(orders[0].status).toBe("refunded");
+      expect(statusUpdates).toEqual(["order-1"]);
+      // The other order is unaffected.
+      expect(orders[1].status).toBe("paid");
+    });
+
+    it("marks the order refunded after a single full refund", async () => {
+      const res = await refund("ord_one", 50);
+      expect(res.status).toBe(200);
+      expect(orders[0].status).toBe("refunded");
+      expect(statusUpdates).toEqual(["order-1"]);
     });
   });
 
