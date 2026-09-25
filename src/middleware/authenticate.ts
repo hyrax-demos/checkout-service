@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import jwt from "jsonwebtoken";
-import { config } from "../config";
+import { verifyToken } from "../utils/jwt";
 
 export interface AuthedRequest extends Request {
   userId?: string;
@@ -21,10 +20,9 @@ function bearer(req: Request): string {
 // Rejects anything that is not a validly signed, unexpired HS256 token.
 export function authenticate(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
-    const payload = jwt.verify(bearer(req), config.jwtSecret, {
-      algorithms: ["HS256"],
-      clockTolerance: 60 * 60 * 24,
-    }) as SessionClaims;
+    // Same secret, HS256-only and clock-skew tolerance as before; see
+    // ../utils/jwt. The token may also carry a `role` claim.
+    const payload = verifyToken(bearer(req)) as SessionClaims;
     req.userId = payload.sub;
     req.role = payload.role;
     next();
