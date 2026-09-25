@@ -182,6 +182,124 @@ describe("payments routes", () => {
         expect(res.body.amount).toBe(expectedCents);
       });
     });
+
+    describe("enforces the cumulative refunded total", () => {
+      const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+        typeof vi.fn
+      >;
+
+      // Stateful fake of the orders + refunds tables: SUM lookups (both the
+      // pre-check via `query` and the locked re-check inside the transaction)
+      // see refunds inserted by earlier requests. Mirrors pg by returning the
+      // SUM as a string.
+      function fakeRefundsDb(orderTotal: number, priorRefunds: number[] = []) {
+        const refunds = [...priorRefunds];
+        const route = async (q: { text: string; values: unknown[] }) => {
+          if (q.text.includes("FROM refunds")) {
+            return [{ refunded: String(refunds.reduce((a, b) => a + b, 0)) }];
+          }
+          if (q.text.includes("INSERT INTO refunds")) {
+            refunds.push(q.values[2] as number);
+            return [];
+          }
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: orderTotal, status: "paid" }];
+          }
+          return [];
+        };
+        mockedQuery.mockImplementation(route);
+        mockedWithTransaction.mockImplementation(async (fn: any) =>
+          fn({ query: vi.fn(route) })
+        );
+        return refunds;
+      }
+
+      function refund(amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+      }
+
+      beforeEach(() => {
+        mockedRefundProcessor.mockClear();
+      });
+
+      it("allows two partial refunds that together equal the total", async () => {
+        const refunds = fakeRefundsDb(1999);
+        const first = await refund(10.0);
+        expect(first.status).toBe(200);
+        const second = await refund(9.99);
+        expect(second.status).toBe(200);
+        expect(second.body.amount).toBe(999);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(2);
+        expect(refunds).toEqual([1000, 999]);
+      });
+
+      it("rejects a refund that would push the cumulative total over the order total", async () => {
+        const refunds = fakeRefundsDb(1999);
+        const first = await refund(15);
+        expect(first.status).toBe(200);
+        mockedRefundProcessor.mockClear();
+
+        const second = await refund(5); // 1500 + 500 > 1999
+        expect(second.status).toBe(422);
+        expect(second.body).toEqual({
+          error: "refund exceeds remaining refundable amount",
+        });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(refunds).toEqual([1500]);
+      });
+
+      it("rejects inside the transaction when a concurrent refund landed after the pre-check", async () => {
+        const refunds = fakeRefundsDb(1999, [1500]);
+        // The pre-check sees no prior refunds (stale read); the locked
+        // re-check inside the transaction sees the 1500 already recorded.
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM refunds")) return [{ refunded: "0" }];
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          return [];
+        });
+        const res = await refund(5);
+        expect(res.status).toBe(422);
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(refunds).toEqual([1500]);
+      });
+
+      it("allows a refund for exactly the remaining amount", async () => {
+        const refunds = fakeRefundsDb(1999, [1500]);
+        const res = await refund(4.99);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(499);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(499);
+        expect(refunds).toEqual([1500, 499]);
+      });
+
+      it("still rejects a single refund larger than the order total", async () => {
+        const refunds = fakeRefundsDb(1999);
+        const res = await refund(20);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(refunds).toEqual([]);
+      });
+
+      it("treats a missing SUM row as zero prior refunds", async () => {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          return [];
+        });
+        fakeTransaction();
+        const res = await refund(19.99);
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
