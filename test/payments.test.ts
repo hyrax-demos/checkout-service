@@ -11,7 +11,17 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -126,6 +136,187 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("passes the refund amount to the processor in integer cents", async () => {
+      const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 5000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      const args = mockedRefundProcessor.mock.calls[0][0];
+      expect(args.orderId).toBe("order-1");
+      // 19.99 * 100 is 1998.9999... in floating point; it must round, not
+      // truncate, and must not be the dollar value.
+      expect(args.amount).toBe(1999);
+      expect(Number.isInteger(args.amount)).toBe(true);
+    });
+  });
+
+  describe("POST /refunds cumulative limit", () => {
+    const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+      typeof vi.fn
+    >;
+
+    // Stateful in-memory stand-in for the orders/refunds tables, shared by
+    // the pool-level `query` mock and every transaction client, so refund
+    // rows written by one request are visible to the next.
+    let orders: { id: string; reference: string; total: number; status: string }[];
+    let refunds: { id: string; order_id: string; amount: number }[];
+
+    function run(q: { text: string; values: unknown[] }) {
+      if (q.text.includes("FROM orders WHERE reference")) {
+        return orders.filter((o) => o.reference === q.values[0]);
+      }
+      if (q.text.includes("SUM(amount)") && q.text.includes("FROM refunds")) {
+        const total = refunds
+          .filter((r) => r.order_id === q.values[0])
+          .reduce((acc, r) => acc + r.amount, 0);
+        // pg returns SUM over an integer column as a bigint string.
+        return [{ refunded: String(total) }];
+      }
+      if (q.text.includes("INSERT INTO refunds")) {
+        const [id, order_id, amount] = q.values as [string, string, number];
+        refunds.push({ id, order_id, amount });
+        return [];
+      }
+      if (q.text.includes("UPDATE orders SET status = 'refunded'")) {
+        statusUpdates.push(q.values[0] as string);
+        for (const o of orders) {
+          if (o.id === q.values[0]) o.status = "refunded";
+        }
+        return [];
+      }
+      return [];
+    }
+
+    let statusUpdates: string[];
+
+    beforeEach(() => {
+      orders = [
+        { id: "order-1", reference: "ord_one", total: 5000, status: "paid" },
+        { id: "order-2", reference: "ord_two", total: 5000, status: "paid" },
+      ];
+      refunds = [];
+      statusUpdates = [];
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: any) => run(q));
+      mockedWithTransaction.mockImplementation(async (fn: any) =>
+        fn({ query: vi.fn(async (q: any) => run(q)) })
+      );
+    });
+
+    function refund(reference: string, amountDollars: number) {
+      return request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference, amountDollars });
+    }
+
+    it("allows two partial refunds that stay under the total", async () => {
+      const first = await refund("ord_one", 20);
+      const second = await refund("ord_one", 15.5);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(2);
+      expect(refunds.map((r) => r.amount)).toEqual([2000, 1550]);
+      expect(refunds.every((r) => r.order_id === "order-1")).toBe(true);
+    });
+
+    it("rejects a refund that would push the cumulative total over the order total", async () => {
+      const first = await refund("ord_one", 30);
+      expect(first.status).toBe(200);
+      mockedRefundProcessor.mockClear();
+
+      // 3000 + 2001 = 5001 > 5000, though 2001 alone is within the total.
+      const second = await refund("ord_one", 20.01);
+      expect(second.status).toBe(422);
+      expect(second.body).toEqual({ error: "refund exceeds order total" });
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds).toHaveLength(1);
+      expect(refunds[0].amount).toBe(3000);
+    });
+
+    it("rejects inside the transaction if the locked re-check finds the limit exceeded", async () => {
+      // Simulate a concurrent refund committing between the early check and
+      // the locked re-check inside the transaction.
+      mockedWithTransaction.mockImplementationOnce(async (fn: any) => {
+        refunds.push({ id: "concurrent", order_id: "order-1", amount: 4000 });
+        return fn({ query: vi.fn(async (q: any) => run(q)) });
+      });
+      const res = await refund("ord_one", 20);
+      expect(res.status).toBe(422);
+      expect(res.body).toEqual({ error: "refund exceeds order total" });
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds.map((r) => r.id)).toEqual(["concurrent"]);
+    });
+
+    it("allows a refund that brings the cumulative total exactly to the order total", async () => {
+      expect((await refund("ord_one", 19.99)).status).toBe(200);
+      // 1999 + 3001 = 5000 exactly.
+      const res = await refund("ord_one", 30.01);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(3001);
+      expect(refunds.reduce((a, r) => a + r.amount, 0)).toBe(5000);
+    });
+
+    it("does not count refunds on a different order toward this order's limit", async () => {
+      expect((await refund("ord_two", 50)).status).toBe(200);
+      const res = await refund("ord_one", 50);
+      expect(res.status).toBe(200);
+      expect(refunds.map((r) => [r.order_id, r.amount])).toEqual([
+        ["order-2", 5000],
+        ["order-1", 5000],
+      ]);
+    });
+
+    it("still rejects a single refund larger than the order total", async () => {
+      const res = await refund("ord_one", 50.01);
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(refunds).toHaveLength(0);
+    });
+
+    it("leaves the order status unchanged after a partial refund", async () => {
+      const res = await refund("ord_one", 20);
+      expect(res.status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      // The status column is not written at all for a partial refund.
+      expect(statusUpdates).toEqual([]);
+    });
+
+    it("marks the order refunded only once partial refunds reach the total", async () => {
+      expect((await refund("ord_one", 19.99)).status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      expect((await refund("ord_one", 10.01)).status).toBe(200);
+      expect(orders[0].status).toBe("paid");
+      expect(statusUpdates).toEqual([]);
+
+      // 1999 + 1001 + 2000 = 5000 exactly.
+      expect((await refund("ord_one", 20)).status).toBe(200);
+      expect(orders[0].status).toBe("refunded");
+      expect(statusUpdates).toEqual(["order-1"]);
+      // The other order is unaffected.
+      expect(orders[1].status).toBe("paid");
+    });
+
+    it("marks the order refunded after a single full refund", async () => {
+      const res = await refund("ord_one", 50);
+      expect(res.status).toBe(200);
+      expect(orders[0].status).toBe("refunded");
+      expect(statusUpdates).toEqual(["order-1"]);
     });
   });
 
