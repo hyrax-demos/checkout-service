@@ -11,7 +11,17 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -126,6 +136,32 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("passes the refund amount to the processor in integer cents", async () => {
+      const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 5000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      const args = mockedRefundProcessor.mock.calls[0][0];
+      expect(args.orderId).toBe("order-1");
+      // 19.99 * 100 is 1998.9999... in floating point; it must round, not
+      // truncate, and must not be the dollar value.
+      expect(args.amount).toBe(1999);
+      expect(Number.isInteger(args.amount)).toBe(true);
     });
   });
 
