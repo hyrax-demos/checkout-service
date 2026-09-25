@@ -122,9 +122,14 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
       await client.query(
         sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
       );
-      await client.query(
-        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-      );
+      // Only mark the order refunded once the cumulative refunded total (this
+      // refund included, both in cents) reaches its captured total. A partial
+      // refund leaves the order row untouched, status included.
+      if (lockedPrior + amountCents >= order.total) {
+        await client.query(
+          sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+        );
+      }
     });
   } catch (e) {
     if (e instanceof RefundExceedsTotalError) {

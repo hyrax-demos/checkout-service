@@ -304,6 +304,108 @@ describe("payments routes", () => {
         expect(texts.some((t: string) => t.includes("UPDATE orders"))).toBe(false);
       });
     });
+
+    describe("marks the order refunded only once it is fully refunded", () => {
+      // In-memory orders + refunds ledger, routed by SQL text, shared by the
+      // pool-level `query` mock and every transaction client. Totals and
+      // ledger amounts are integer cents. Status writes are applied to the
+      // in-memory order so tests can assert on the resulting state.
+      type LedgerRow = { orderId: string; amount: number };
+      type OrderRow = { id: string; total: number; status: string; reference: string };
+      let ledger: LedgerRow[];
+      let orders: Record<string, OrderRow>;
+      let txClients: { query: ReturnType<typeof vi.fn> }[];
+
+      function route(q: { text: string; values: unknown[] }) {
+        if (q.text.includes("FROM refunds")) {
+          const orderId = q.values[0];
+          const sum = ledger
+            .filter((r) => r.orderId === orderId)
+            .reduce((acc, r) => acc + r.amount, 0);
+          return [{ refunded: String(sum) }];
+        }
+        if (q.text.includes("INSERT INTO refunds")) {
+          const [, orderId, amount] = q.values as [string, string, number];
+          ledger.push({ orderId, amount });
+          return [];
+        }
+        if (q.text.includes("UPDATE orders")) {
+          const id = q.values[q.values.length - 1];
+          const order = Object.values(orders).find((o) => o.id === id);
+          const m = q.text.match(/status = '(\w+)'/);
+          if (order && m) order.status = m[1];
+          return [];
+        }
+        if (q.text.includes("FROM orders") && q.text.includes("reference")) {
+          const order = orders[q.values[0] as string];
+          return order
+            ? [{ id: order.id, total: order.total, status: order.status }]
+            : [];
+        }
+        return [];
+      }
+
+      beforeEach(() => {
+        ledger = [];
+        txClients = [];
+        orders = {
+          ord_a: { id: "order-a", total: 5000, status: "paid", reference: "ord_a" },
+        };
+        mockedQuery.mockImplementation(async (q: any) => route(q));
+        mockedWithTransaction.mockImplementation(async (fn: any) => {
+          const client = { query: vi.fn(async (q: any) => route(q)) };
+          txClients.push(client);
+          return fn(client);
+        });
+      });
+
+      function refund(reference: string, amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference, amountDollars });
+      }
+
+      function orderWrites(client: { query: ReturnType<typeof vi.fn> }) {
+        return client.query.mock.calls
+          .map((c: any[]) => c[0].text as string)
+          .filter((t) => t.includes("UPDATE orders"));
+      }
+
+      it("leaves the status unchanged after a partial refund", async () => {
+        const res = await refund("ord_a", 20);
+        expect(res.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+        expect(orders.ord_a.total).toBe(5000);
+        // No write to the order row at all for a partial refund.
+        expect(orderWrites(txClients[0])).toEqual([]);
+        expect(ledger).toEqual([{ orderId: "order-a", amount: 2000 }]);
+      });
+
+      it("sets status refunded after a single full refund", async () => {
+        const res = await refund("ord_a", 50);
+        expect(res.status).toBe(200);
+        expect(orders.ord_a.status).toBe("refunded");
+        expect(orderWrites(txClients[0])).toHaveLength(1);
+      });
+
+      it("keeps status until the partial refund that reaches the total", async () => {
+        const first = await refund("ord_a", 10);
+        expect(first.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+
+        const second = await refund("ord_a", 15.5);
+        expect(second.status).toBe(200);
+        expect(orders.ord_a.status).toBe("paid");
+
+        const third = await refund("ord_a", 24.5);
+        expect(third.status).toBe(200);
+        expect(orders.ord_a.status).toBe("refunded");
+
+        expect(txClients.map(orderWrites).map((w) => w.length)).toEqual([0, 0, 1]);
+        expect(ledger.reduce((acc, r) => acc + r.amount, 0)).toBe(5000);
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
