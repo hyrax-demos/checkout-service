@@ -11,11 +11,26 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Wrap the processor boundary in spies (resolving, like the demo build) so
+// tests can assert on exactly what the routes send upstream.
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +50,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +142,49 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("sends the refund amount to the processor in integer cents", () => {
+      // Order total is large enough that none of these refunds trips the
+      // over-refund check; this block is only about units.
+      function paidOrder() {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 100000, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      it.each([
+        [12.34, 1234],
+        [0.29, 29], // 0.29 * 100 === 28.999999999999996
+        [19.99, 1999], // 19.99 * 100 === 1998.9999999999998
+        [0.07, 7], // 0.07 * 100 === 7.000000000000001
+        [5, 500],
+      ])("refund of $%s -> %i cents", async (amountDollars, expectedCents) => {
+        paidOrder();
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+        expect(res.status).toBe(200);
+
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.orderId).toBe("order-1");
+        expect(args.amount).toBe(expectedCents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+
+        // The refunds ledger row records the same cents value.
+        const insert = client.query.mock.calls
+          .map((c: any[]) => c[0])
+          .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+        expect(insert).toBeDefined();
+        expect(insert.values).toContain(expectedCents);
+        expect(res.body.amount).toBe(expectedCents);
+      });
     });
   });
 
