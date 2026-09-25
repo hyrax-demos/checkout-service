@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { query, sql, withTransaction } from "../db";
+import { query, sql, SqlQuery, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -68,28 +68,67 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   const amountCents = Math.round(amountDollars * 100);
 
-  // A refund may not exceed the order's captured total.
-  if (amountCents > order.total) {
+  // `order.total` is integer cents (see `Order` in ../types), as is every
+  // `refunds.amount`, so all comparisons below are cents-to-cents. The
+  // cumulative check subsumes the single-request one (prior = 0).
+  const exceedsTotal = (priorRefundedCents: number) =>
+    priorRefundedCents + amountCents > order.total;
+
+  // Cheap early reject outside the transaction; re-checked under lock below.
+  if (exceedsTotal(await priorRefundedCents(query, order.id))) {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
+  const outcome = await withTransaction(async (client) => {
+    // Lock the order row so concurrent refunds for the same order serialize
+    // here, then re-sum: another refund may have committed since the check
+    // above.
+    await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
+    const priorCents = await priorRefundedCents((q) => client.query(q), order.id);
+    if (exceedsTotal(priorCents)) {
+      return "exceeds_total" as const;
+    }
+
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents, // cents, per RefundArgs contract
       apiKey: config.paymentApiKey,
     });
     await client.query(
       sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
+    // Only a refund that brings the cumulative total (cents, including this
+    // one) up to the captured total marks the order refunded; a partial
+    // refund leaves the order's status as it was.
+    const cumulativeCents = priorCents + amountCents;
+    if (cumulativeCents >= order.total) {
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+    }
+    return "refunded" as const;
   });
+
+  if (outcome === "exceeds_total") {
+    return res.status(422).json({ error: "refund exceeds order total" });
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
+
+// Sum (in cents) of every refund already recorded against an order; 0 when
+// there are none. `SUM` over a bigint-ish column comes back from pg as a
+// string, hence the `Number`.
+async function priorRefundedCents(
+  run: (q: SqlQuery) => Promise<{ refunded: string | number }[]>,
+  orderId: string
+): Promise<number> {
+  const rows = await run(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${orderId}`
+  );
+  return Number(rows[0]?.refunded ?? 0);
+}
 
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
