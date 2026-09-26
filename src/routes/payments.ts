@@ -55,8 +55,10 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
 
+  // Scope the lookup to the caller: another customer's reference is
+  // indistinguishable from a nonexistent one (404, not 403).
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
