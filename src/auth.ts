@@ -4,6 +4,12 @@ import { config } from "./config";
 
 const TOKEN_TTL_SECONDS = 60 * 60; // one-hour sessions
 
+// Maximum allowed clock skew, in seconds, when checking a session token's
+// expiry. A token whose `exp` is more than this many seconds in the past is
+// rejected; a token whose `exp` is at most this many seconds in the past is
+// still accepted.
+export const MAX_CLOCK_SKEW_SECONDS = 60;
+
 // Issue a signed session token for an authenticated user.
 export function signToken(userId: string): string {
   return jwt.sign({ sub: userId }, config.jwtSecret, {
@@ -19,7 +25,13 @@ export function verifyToken(token: string): { sub: string } {
     algorithms: ["HS256"],
     // Allow a little slack for clock drift between the API nodes and the
     // clients that mint refresh requests.
-    clockTolerance: 60 * 60 * 24,
+    //
+    // jsonwebtoken@8.5.1 rejects when `nowSeconds >= exp + clockTolerance`,
+    // so a plain `clockTolerance: MAX_CLOCK_SKEW_SECONDS` would reject a
+    // token whose `exp` is exactly MAX_CLOCK_SKEW_SECONDS in the past. The
+    // "+1" corrects that off-by-one so exp = now-60 is accepted and
+    // exp = now-61 is rejected.
+    clockTolerance: MAX_CLOCK_SKEW_SECONDS + 1,
   }) as { sub: string };
 }
 
