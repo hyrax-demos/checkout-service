@@ -103,9 +103,16 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     sql`SELECT id, total, status FROM orders WHERE id = ANY(${orderIds}) AND customer_id = ${req.userId}`
   );
 
+  // Only orders still awaiting payment may be captured. Anything else that was
+  // requested (already paid, cancelled, refunded, or not found for this
+  // caller) is reported back as skipped rather than charged.
+  const pending = rows.filter((order) => order.status === "pending");
+  const pendingIds = new Set(pending.map((order) => order.id));
+  const skipped = [...new Set(orderIds)].filter((id) => !pendingIds.has(id));
+
   const captured: string[] = [];
   await Promise.all(
-    rows.map(async (order) => {
+    pending.map(async (order) => {
       await chargeProcessor({
         amount: order.total,
         apiKey: config.paymentApiKey,
@@ -119,5 +126,5 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     // record which ones actually settled.
   });
 
-  res.json({ ok: true, captured });
+  res.json({ ok: true, captured, skipped });
 });

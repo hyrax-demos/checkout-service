@@ -13,6 +13,7 @@ vi.mock("../src/db", () => ({
 
 import { query, withTransaction } from "../src/db";
 import { buildApp } from "./helpers/app";
+import * as processor from "../src/processor";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -151,6 +152,61 @@ describe("payments routes", () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.captured.sort()).toEqual(["order-1", "order-2"]);
+      expect(res.body.skipped).toEqual([]);
+    });
+
+    it("only charges pending orders and reports the rest as skipped", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "paid" },
+        { id: "order-3", total: 900, status: "cancelled" },
+        { id: "order-4", total: 1100, status: "refunded" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const chargeSpy = vi.spyOn(processor, "chargeProcessor");
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2", "order-3", "order-4"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.skipped.sort()).toEqual(["order-2", "order-3", "order-4"]);
+      expect(chargeSpy).toHaveBeenCalledTimes(1);
+      expect(chargeSpy.mock.calls[0][0].amount).toBe(500);
+      // Lookup + a single status update for the one pending order.
+      expect(mockedQuery).toHaveBeenCalledTimes(2);
+      chargeSpy.mockRestore();
+    });
+
+    it("skips requested ids that were not found for the caller", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-missing"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.skipped).toEqual(["order-missing"]);
+    });
+
+    it("charges nothing when no requested order is pending", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-2", total: 700, status: "paid" },
+      ]);
+      const chargeSpy = vi.spyOn(processor, "chargeProcessor");
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-2"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual([]);
+      expect(res.body.skipped).toEqual(["order-2"]);
+      expect(chargeSpy).not.toHaveBeenCalled();
+      expect(mockedQuery).toHaveBeenCalledTimes(1);
+      chargeSpy.mockRestore();
     });
   });
 });
