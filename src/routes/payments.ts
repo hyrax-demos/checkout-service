@@ -142,21 +142,42 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     sql`SELECT id, total, status FROM orders WHERE id = ANY(${orderIds}) AND customer_id = ${req.userId}`
   );
 
+  const byId = new Map(rows.map((order) => [order.id, order]));
   const captured: string[] = [];
-  await Promise.all(
-    rows.map(async (order) => {
+  const failed: { orderId: string; error: string }[] = [];
+  const skipped: { orderId: string; status: OrderStatus }[] = [];
+
+  // Capture sequentially, in request order: one processor call in flight at a
+  // time, and each order's outcome is recorded independently so one failure
+  // neither aborts nor hides the rest of the batch.
+  for (const orderId of new Set(orderIds)) {
+    const order = byId.get(orderId);
+    if (!order) {
+      failed.push({ orderId, error: "order not found" });
+      continue;
+    }
+    // Only orders still awaiting payment are charged; anything already paid,
+    // refunded or cancelled must never reach the processor again.
+    if (order.status !== "pending") {
+      skipped.push({ orderId, status: order.status });
+      continue;
+    }
+
+    try {
       await chargeProcessor({
-        amount: order.total,
+        amount: order.total, // cents
         apiKey: config.paymentApiKey,
         idempotencyKey: chargeIdempotencyKey(order.id),
       });
       await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
       captured.push(order.id);
-    })
-  ).catch(() => {
-    // One or more captures may have failed; the per-order status updates above
-    // record which ones actually settled.
-  });
+    } catch (e) {
+      failed.push({
+        orderId: order.id,
+        error: e instanceof ProcessorError ? "payment declined" : "capture failed",
+      });
+    }
+  }
 
-  res.json({ ok: true, captured });
+  res.json({ ok: failed.length === 0, captured, failed, skipped });
 });

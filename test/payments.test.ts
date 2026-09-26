@@ -13,14 +13,26 @@ vi.mock("../src/db", () => ({
 
 vi.mock("../src/processor", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/processor")>();
-  return { ...actual, refundProcessor: vi.fn(actual.refundProcessor) };
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
 });
 
 import { query, withTransaction } from "../src/db";
-import { refundProcessor } from "../src/processor";
+import {
+  chargeProcessor,
+  refundProcessor,
+  ProcessorError,
+} from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
+
+const mockedChargeProcessor = chargeProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -46,6 +58,7 @@ describe("payments routes", () => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
     mockedRefundProcessor.mockClear();
+    mockedChargeProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -336,6 +349,134 @@ describe("payments routes", () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.captured.sort()).toEqual(["order-1", "order-2"]);
+    });
+
+    function chargedOrderKeys() {
+      return mockedChargeProcessor.mock.calls.map(
+        (c) => (c[0] as { idempotencyKey: string }).idempotencyKey
+      );
+    }
+
+    function paidUpdates() {
+      return mockedQuery.mock.calls
+        .map((c) => c[0] as { text: string; values: unknown[] })
+        .filter((q) => q.text.includes("UPDATE orders SET status = 'paid'"))
+        .map((q) => q.values[0]);
+    }
+
+    it("skips orders that are not pending", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "paid" },
+        { id: "order-3", total: 900, status: "cancelled" },
+        { id: "order-4", total: 300, status: "refunded" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2", "order-3", "order-4"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.failed).toEqual([]);
+      expect(res.body.skipped.map((s: { orderId: string }) => s.orderId)).toEqual([
+        "order-2",
+        "order-3",
+        "order-4",
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedChargeProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 500 })
+      );
+      expect(paidUpdates()).toEqual(["order-1"]);
+    });
+
+    it("charges orders sequentially, one at a time", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+        { id: "order-3", total: 900, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      let inFlight = 0;
+      let maxInFlight = 0;
+      mockedChargeProcessor.mockImplementation(async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight -= 1;
+      });
+      try {
+        const res = await request(app)
+          .post("/payments/capture-batch")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ orderIds: ["order-1", "order-2", "order-3"] });
+        expect(res.status).toBe(200);
+        expect(res.body.captured).toEqual(["order-1", "order-2", "order-3"]);
+        expect(maxInFlight).toBe(1);
+      } finally {
+        mockedChargeProcessor.mockImplementation(async () => {});
+      }
+    });
+
+    it("uses a per-order idempotency key for each charge", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2"] });
+      const keys = chargedOrderKeys();
+      expect(keys).toHaveLength(2);
+      expect(keys[0]).toContain("order-1");
+      expect(keys[1]).toContain("order-2");
+    });
+
+    it("reports failed captures and continues with the rest of the batch", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+        { id: "order-3", total: 900, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      mockedChargeProcessor
+        .mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => {
+          throw new ProcessorError("card declined");
+        })
+        .mockImplementationOnce(async () => {});
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2", "order-3"] });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(false);
+      expect(res.body.captured).toEqual(["order-1", "order-3"]);
+      expect(res.body.failed).toEqual([
+        { orderId: "order-2", error: "payment declined" },
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(3);
+      expect(paidUpdates()).toEqual(["order-1", "order-3"]);
+    });
+
+    it("reports orders that are not found for the caller as failed", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-x"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.failed).toEqual([
+        { orderId: "order-x", error: "order not found" },
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(1);
     });
   });
 });
