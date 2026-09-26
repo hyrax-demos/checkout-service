@@ -198,6 +198,122 @@ describe("payments routes", () => {
     });
   });
 
+  describe("POST /refunds cumulative refund limits", () => {
+    const paidOrder = { id: "order-1", total: 1999, status: "paid" };
+
+    // Route the pool-level queries by SQL text: the order lookup returns the
+    // given order, the refund-ledger sum returns `priorRefunded`.
+    function routeQueries(order: object, priorRefunded: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) return [order];
+        if (q.text.includes("FROM refunds")) {
+          return [{ refunded: String(priorRefunded) }];
+        }
+        return [];
+      });
+    }
+
+    // A transaction client whose refund-ledger sum returns `lockedRefunded`
+    // (what the ledger holds once the order row is locked).
+    function ledgerTransaction(lockedRefunded: number) {
+      const client = {
+        query: vi.fn(async (q: { text: string }) => {
+          if (q.text.includes("FROM refunds")) {
+            return [{ refunded: String(lockedRefunded) }];
+          }
+          return [];
+        }),
+      };
+      mockedWithTransaction.mockImplementationOnce(async (fn: any) => fn(client));
+      return client;
+    }
+
+    function statusUpdate(client: { query: ReturnType<typeof vi.fn> }) {
+      const call = client.query.mock.calls
+        .map((c) => c[0] as { text: string; values: unknown[] })
+        .find((q) => q.text.includes("UPDATE orders SET status"));
+      return call;
+    }
+
+    it("rejects a refund that exceeds the remaining amount after prior refunds", async () => {
+      routeQueries(paidOrder, 1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("marks the order partially_refunded after a partial refund", async () => {
+      routeQueries(paidOrder, 0);
+      const client = ledgerTransaction(0);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(500);
+      const update = statusUpdate(client);
+      expect(update).toBeDefined();
+      expect(update!.values).toContain("partially_refunded");
+      expect(update!.values).not.toContain("refunded");
+    });
+
+    it("allows a second partial refund on a partially refunded order", async () => {
+      routeQueries({ ...paidOrder, status: "partially_refunded" }, 500);
+      const client = ledgerTransaction(500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(statusUpdate(client)!.values).toContain("partially_refunded");
+    });
+
+    it("marks the order refunded once prior + current refunds reach the total", async () => {
+      routeQueries({ ...paidOrder, status: "partially_refunded" }, 1500);
+      const client = ledgerTransaction(1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 4.99 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(499);
+      expect(statusUpdate(client)!.values).toContain("refunded");
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 499 })
+      );
+    });
+
+    it("rejects any refund on a fully refunded order", async () => {
+      routeQueries({ ...paidOrder, status: "refunded" }, 1999);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 0.01 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("re-checks the ledger under the order lock and rejects a concurrent over-refund", async () => {
+      // The pre-check sees no prior refunds, but by the time the order row is
+      // locked a concurrent request has recorded 1500 cents.
+      routeQueries(paidOrder, 0);
+      const client = ledgerTransaction(1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 10 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      const texts = client.query.mock.calls.map((c) => (c[0] as { text: string }).text);
+      expect(texts.some((t) => t.includes("FOR UPDATE"))).toBe(true);
+      expect(texts.some((t) => t.includes("INSERT INTO refunds"))).toBe(false);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)

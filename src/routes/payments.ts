@@ -3,7 +3,7 @@ import { query, sql, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
-import { Order } from "../types";
+import { Order, OrderStatus } from "../types";
 import {
   chargeProcessor,
   refundProcessor,
@@ -11,6 +11,17 @@ import {
 } from "../processor";
 
 export const payments = Router();
+
+// Raised inside the refund transaction when the ledger, re-read under the
+// order row lock, shows the requested amount exceeds what remains refundable.
+class RefundExceedsRemainingError extends Error {}
+
+// Normalise a `COALESCE(SUM(amount), 0) AS refunded` result to integer cents.
+// pg returns SUM over integer columns as a string (bigint/numeric).
+function refundedCents(rows: { refunded: string | number | null }[]): number {
+  const value = rows[0]?.refunded;
+  return value == null ? 0 : Number(value);
+}
 
 // Capture payment for an order against the upstream processor.
 payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
@@ -70,25 +81,51 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   const amountCents = Math.round(amountDollars * 100);
 
-  // A refund may not exceed the order's captured total.
-  if (amountCents > order.total) {
-    return res.status(422).json({ error: "refund exceeds order total" });
+  // Fast path: reject against the refunds already recorded for this order so
+  // a request that obviously over-refunds never reaches the transaction. The
+  // authoritative check is repeated under a row lock below.
+  const priorRows = await query<{ refunded: string | number | null }>(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${order.id}`
+  );
+  if (amountCents > order.total - refundedCents(priorRows)) {
+    return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountCents, // cents, like every other processor call
-      apiKey: config.paymentApiKey,
+  try {
+    await withTransaction(async (client) => {
+      // Serialise refunds per order: lock the order row, then re-read the
+      // refund ledger so two concurrent partial refunds cannot both pass the
+      // check against the same prior total.
+      await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
+      const lockedRows = await client.query<{ refunded: string | number | null }>(
+        sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${order.id}`
+      );
+      const alreadyRefunded = refundedCents(lockedRows);
+      if (amountCents > order.total - alreadyRefunded) {
+        throw new RefundExceedsRemainingError();
+      }
+
+      await refundProcessor({
+        orderId: order.id,
+        amount: amountCents, // cents, like every other processor call
+        apiKey: config.paymentApiKey,
+      });
+      await client.query(
+        sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
+      );
+      const nextStatus: OrderStatus =
+        alreadyRefunded + amountCents >= order.total ? "refunded" : "partially_refunded";
+      await client.query(
+        sql`UPDATE orders SET status = ${nextStatus} WHERE id = ${order.id}`
+      );
     });
-    await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
-    );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
-  });
+  } catch (e) {
+    if (e instanceof RefundExceedsRemainingError) {
+      return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
+    }
+    throw e;
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
