@@ -132,6 +132,17 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
+//
+// Response shape:
+//   400 { error: string } when `orderIds` is missing or an empty array.
+//   200 {
+//     ok: boolean,                                  // true only if `failed` is empty
+//     captured: string[],                           // order ids charged and marked paid, in request order
+//     failed: { orderId: string; error: string }[], // "order not found" | "payment declined" | "capture failed"
+//     skipped: { orderId: string; status: OrderStatus }[], // found but not pending; never charged
+//   }
+// Duplicate ids in the request are processed once. A 200 is returned even when
+// some or all captures fail; callers must inspect `ok` / `failed`.
 payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Response) => {
   const { orderIds } = req.body as { orderIds: string[] };
   if (!Array.isArray(orderIds) || orderIds.length === 0) {
