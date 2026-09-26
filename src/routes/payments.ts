@@ -103,15 +103,28 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     sql`SELECT id, total, status FROM orders WHERE id = ANY(${orderIds}) AND customer_id = ${req.userId}`
   );
 
+  // Only orders still awaiting payment may be captured. Anything else that was
+  // requested (already paid, cancelled, refunded, or not found for this
+  // caller) is reported back as skipped rather than charged.
+  const pending = rows.filter((order) => order.status === "pending");
+  const pendingIds = new Set(pending.map((order) => order.id));
+  const skipped = [...new Set(orderIds)].filter((id) => !pendingIds.has(id));
+
   const captured: string[] = [];
   await Promise.all(
-    rows.map(async (order) => {
+    pending.map(async (order) => {
       await chargeProcessor({
         amount: order.total,
         apiKey: config.paymentApiKey,
         idempotencyKey: chargeIdempotencyKey(order.id),
       });
-      await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
+      // Re-assert the pending precondition in the write itself so the
+      // check-and-set is atomic: an order that was cancelled, refunded or
+      // settled by a concurrent request after the lookup above is never
+      // overwritten back to 'paid'.
+      await query(
+        sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id} AND status = 'pending'`
+      );
       captured.push(order.id);
     })
   ).catch(() => {
@@ -119,5 +132,5 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     // record which ones actually settled.
   });
 
-  res.json({ ok: true, captured });
+  res.json({ ok: true, captured, skipped });
 });
