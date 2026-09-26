@@ -1,7 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import jwt from "jsonwebtoken";
-import { config } from "../config";
-import { MAX_CLOCK_SKEW_SECONDS } from "../auth";
+import { verifyToken } from "../utils/jwt";
 
 export interface AuthedRequest extends Request {
   userId?: string;
@@ -22,14 +20,10 @@ function bearer(req: Request): string {
 // Rejects anything that is not a validly signed, unexpired HS256 token.
 export function authenticate(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
-    const payload = jwt.verify(bearer(req), config.jwtSecret, {
-      algorithms: ["HS256"],
-      // jsonwebtoken@8.5.1 rejects when `nowSeconds >= exp + clockTolerance`,
-      // so the "+1" makes exp = now-MAX_CLOCK_SKEW_SECONDS accepted while
-      // exp = now-(MAX_CLOCK_SKEW_SECONDS + 1) is rejected. See the matching
-      // comment on `verifyToken` in `src/auth.ts`.
-      clockTolerance: MAX_CLOCK_SKEW_SECONDS + 1,
-    }) as SessionClaims;
+    // `verifyToken`'s declared return type only names `sub`, but at runtime
+    // it returns the full decoded payload (as the inline `jwt.verify` call
+    // it replaces did), so `role` is still present on tokens that carry it.
+    const payload = verifyToken(bearer(req)) as SessionClaims;
     req.userId = payload.sub;
     req.role = payload.role;
     next();
