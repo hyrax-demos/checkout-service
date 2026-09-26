@@ -203,6 +203,121 @@ describe("payments routes", () => {
     });
   });
 
+  describe("GET /orders/:id/refunds", () => {
+    // Fake DB: order-1 (total 5000) is owned by user-1, order-2 by user-2.
+    // Like a real WHERE clause, an order lookup only matches when it is scoped
+    // to the owner (or unscoped). Refunds are returned deliberately out of
+    // order so the route's ordering is actually exercised.
+    function fakeRefundDb() {
+      const orders: Record<string, { customer: string; total: number }> = {
+        "order-1": { customer: "user-1", total: 5000 },
+        "order-2": { customer: "user-2", total: 3000 },
+      };
+      const refunds: Record<string, any[]> = {
+        "order-1": [
+          { id: "rf-old", amount: 500, created_at: "2026-01-01T10:00:00.000Z" },
+          { id: "rf-new", amount: 1200, created_at: "2026-03-01T10:00:00.000Z" },
+          { id: "rf-mid", amount: 300, created_at: "2026-02-01T10:00:00.000Z" },
+        ],
+        "order-2": [
+          { id: "rf-x", amount: 100, created_at: "2026-01-05T10:00:00.000Z" },
+        ],
+      };
+      mockedQuery.mockImplementation(
+        async (q: { text: string; values: unknown[] }) => {
+          if (q.text.includes("FROM orders")) {
+            const id = q.values[0] as string;
+            const order = orders[id];
+            if (!order) return [];
+            const scopedToOwner =
+              !q.text.includes("customer_id") ||
+              q.values.includes(order.customer);
+            return scopedToOwner
+              ? [{ id, total: order.total, status: "paid" }]
+              : [];
+          }
+          if (q.text.includes("FROM refunds")) {
+            return refunds[q.values[0] as string] ?? [];
+          }
+          return [];
+        }
+      );
+    }
+
+    it("returns 404 for another customer's order", async () => {
+      fakeRefundDb();
+      const res = await request(app)
+        .get("/orders/order-2/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+      expect(res.body.refunds).toBeUndefined();
+      const lookup = mockedQuery.mock.calls[0][0] as {
+        text: string;
+        values: unknown[];
+      };
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
+      // Never reaches the refunds table for an order the caller doesn't own.
+      expect(
+        mockedQuery.mock.calls.some((c) =>
+          (c[0] as { text: string }).text.includes("FROM refunds")
+        )
+      ).toBe(false);
+    });
+
+    it("returns 404 for an order that does not exist", async () => {
+      fakeRefundDb();
+      const res = await request(app)
+        .get("/orders/order-missing/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+    });
+
+    it("requires authentication", async () => {
+      const res = await request(app).get("/orders/order-1/refunds");
+      expect(res.status).toBe(401);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("lists the caller's refunds newest first with amounts in cents", async () => {
+      fakeRefundDb();
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.refunds).toEqual([
+        { id: "rf-new", amount: 1200, created_at: "2026-03-01T10:00:00.000Z" },
+        { id: "rf-mid", amount: 300, created_at: "2026-02-01T10:00:00.000Z" },
+        { id: "rf-old", amount: 500, created_at: "2026-01-01T10:00:00.000Z" },
+      ]);
+    });
+
+    it("reports the remaining refundable amount", async () => {
+      fakeRefundDb();
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      // 5000 - (500 + 1200 + 300)
+      expect(res.body.remaining).toBe(3000);
+    });
+
+    it("reports the full total as remaining when nothing has been refunded", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.refunds).toEqual([]);
+      expect(res.body.remaining).toBe(1999);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)
