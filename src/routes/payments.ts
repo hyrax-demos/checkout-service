@@ -66,6 +66,11 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
+  // The processor's API (like our `Order.total`) takes integer cents, so
+  // convert the storefront's dollar value to minor units. Rounding avoids
+  // floating-point artifacts (e.g. 19.99 * 100 = 1998.9999...) and keeps the
+  // amount comparable against `order.total` and consistent with the stored
+  // refund row.
   const amountCents = Math.round(amountDollars * 100);
 
   // A refund may not exceed the order's captured total.
