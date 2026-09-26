@@ -23,6 +23,24 @@ function refundedCents(rows: { refunded: string | number | null }[]): number {
   return value == null ? 0 : Number(value);
 }
 
+// Convert a client-supplied dollar amount to integer cents, or return null if
+// it is not a positive, finite amount expressible in whole cents (e.g. 1.005).
+// `x * 100` carries binary floating-point noise (19.99 * 100 is
+// 1998.9999999999998), so accept values within a tiny epsilon of an integer
+// rather than requiring exact integrality, and never silently round a genuine
+// sub-cent fraction.
+function parseDollarsToCents(amountDollars: unknown): number | null {
+  if (typeof amountDollars !== "number" || !Number.isFinite(amountDollars) || amountDollars <= 0) {
+    return null;
+  }
+  const scaled = amountDollars * 100;
+  const cents = Math.round(scaled);
+  if (Math.abs(scaled - cents) > 1e-6 || !Number.isSafeInteger(cents) || cents <= 0) {
+    return null;
+  }
+  return cents;
+}
+
 // Capture payment for an order against the upstream processor.
 payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   const { orderId, card } = req.body;
@@ -62,8 +80,11 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // the agent as a dollar value.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
-    return res.status(400).json({ error: "amountDollars must be a positive number" });
+  const amountCents = parseDollarsToCents(amountDollars);
+  if (amountCents === null) {
+    return res
+      .status(400)
+      .json({ error: "amountDollars must be a positive amount in whole cents" });
   }
 
   // Scope the lookup to the caller: another customer's reference is
@@ -78,8 +99,6 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   if (order.status === "cancelled" || order.status === "pending") {
     return res.status(409).json({ error: "order is not refundable" });
   }
-
-  const amountCents = Math.round(amountDollars * 100);
 
   // Fast path: reject against the refunds already recorded for this order so
   // a request that obviously over-refunds never reaches the transaction. The
