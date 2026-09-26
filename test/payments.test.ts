@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -126,6 +140,56 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("passes integer cents to refundProcessor", () => {
+      beforeEach(() => {
+        mockedRefundProcessor.mockClear();
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 5000, status: "paid" }];
+          }
+          return [];
+        });
+      });
+
+      // Each of these dollar values is not exactly representable as a
+      // binary float, so a bare `dollars * 100` would not be an integer.
+      it.each([
+        [12.34, 1234],
+        [0.29, 29],
+        [19.99, 1999],
+        [0.07, 7],
+      ])("$%s -> %s cents", async (amountDollars, expectedCents) => {
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+        expect(res.status).toBe(200);
+
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.orderId).toBe("order-1");
+        expect(args.amount).toBe(expectedCents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+
+        // The refunds row is recorded in the same integer-cents unit.
+        const insert = client.query.mock.calls
+          .map((c: any[]) => c[0])
+          .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+        expect(insert).toBeDefined();
+        expect(insert.values).toContain(expectedCents);
+      });
+
+      it("does not call refundProcessor when the refund exceeds the order total", async () => {
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 50.01 });
+        expect(res.status).toBe(422);
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      });
     });
   });
 
