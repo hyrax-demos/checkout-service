@@ -15,7 +15,8 @@ export function slugify(s: string): string {
 }
 
 // Shorten `s` to at most `n` characters, appending an ellipsis ("…") when
-// truncation occurs. Strings of length <= n are returned unchanged.
+// truncation occurs. The ellipsis counts toward the n-character budget.
+// Strings of length <= n are returned unchanged; n === 0 yields "".
 // Throws RangeError when n is negative.
 export function truncate(s: string, n: number): string {
   if (n < 0) {
@@ -24,5 +25,8 @@ export function truncate(s: string, n: number): string {
   if (s.length <= n) {
     return s;
   }
-  return s.slice(0, n) + "…";
+  if (n === 0) {
+    return "";
+  }
+  return s.slice(0, n - 1) + "…";
 }

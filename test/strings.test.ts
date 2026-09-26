@@ -21,7 +21,25 @@ describe("slugify", () => {
 
 describe("truncate", () => {
   it("truncates longer strings and appends an ellipsis", () => {
-    expect(truncate("abcdef", 3)).toBe("abc…");
+    expect(truncate("abcdef", 3)).toBe("ab…");
+  });
+
+  it("never returns more than n characters including the ellipsis", () => {
+    expect(truncate("abcdef", 3).length).toBeLessThanOrEqual(3);
+  });
+
+  it("returns an empty string when n is 0", () => {
+    expect(truncate("abc", 0)).toBe("");
+    expect(truncate("", 0)).toBe("");
+  });
+
+  it("returns just the ellipsis when n is 1 and truncation occurs", () => {
+    expect(truncate("abc", 1)).toBe("…");
+    expect(truncate("a", 1)).toBe("a");
+  });
+
+  it("returns the string unchanged when its length equals n", () => {
+    expect(truncate("abc", 3)).toBe("abc");
   });
 
   it("returns short strings unchanged", () => {
