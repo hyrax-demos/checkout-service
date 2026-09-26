@@ -13,3 +13,16 @@ export function slugify(s: string): string {
     .filter((part) => part.length > 0)
     .join(SLUG_SEPARATOR);
 }
+
+// Shorten `s` to at most `n` characters, appending an ellipsis ("…") when
+// truncation occurs. Strings of length <= n are returned unchanged.
+// Throws RangeError when n is negative.
+export function truncate(s: string, n: number): string {
+  if (n < 0) {
+    throw new RangeError(`truncate: n must be >= 0, got ${n}`);
+  }
+  if (s.length <= n) {
+    return s;
+  }
+  return s.slice(0, n) + "…";
+}
