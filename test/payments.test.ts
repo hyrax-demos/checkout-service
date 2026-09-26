@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importActual) => {
+  const actual = await importActual<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor, ProcessorError } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -35,6 +49,8 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockReset();
+    mockedRefundProcessor.mockResolvedValue(undefined);
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +142,161 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("refund correctness", () => {
+      // Transaction client whose prior-refund SUM returns `alreadyRefunded`.
+      function refundTransaction(alreadyRefunded: number, calls: string[]) {
+        const client = {
+          query: vi.fn(async (q: { text: string }) => {
+            calls.push(`tx:${q.text}`);
+            if (q.text.includes("SUM(amount)")) {
+              return [{ refunded: alreadyRefunded }];
+            }
+            return [];
+          }),
+        };
+        mockedWithTransaction.mockImplementationOnce(async (fn: any) =>
+          fn(client)
+        );
+        return client;
+      }
+
+      function routeQueries(
+        order: { id: string; total: number; status: string },
+        calls: string[]
+      ) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          calls.push(`q:${q.text}`);
+          if (q.text.includes("FROM orders")) return [order];
+          return [];
+        });
+      }
+
+      it("scopes the order lookup to the authenticated customer", async () => {
+        mockedQuery.mockResolvedValueOnce([]);
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_someone_else", amountDollars: 5 });
+        expect(res.status).toBe(404);
+        const lookup = mockedQuery.mock.calls[0][0];
+        expect(lookup.text).toContain("customer_id");
+        expect(lookup.values).toEqual(["ord_someone_else", "user-1"]);
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      });
+
+      it("passes the refund amount to the processor in cents", async () => {
+        const calls: string[] = [];
+        routeQueries({ id: "order-1", total: 1999, status: "paid" }, calls);
+        refundTransaction(0, calls);
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 12.34 });
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(1234);
+      });
+
+      it("rejects a refund exceeding the remaining refundable amount", async () => {
+        const calls: string[] = [];
+        routeQueries(
+          { id: "order-1", total: 1999, status: "partially_refunded" },
+          calls
+        );
+        const client = refundTransaction(1500, calls);
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 5 });
+        expect(res.status).toBe(422);
+        expect(res.body.remaining).toBe(499);
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(
+          client.query.mock.calls.some((c: any[]) =>
+            c[0].text.includes("INSERT INTO refunds")
+          )
+        ).toBe(false);
+      });
+
+      it("allows a further partial refund on a partially refunded order", async () => {
+        const calls: string[] = [];
+        routeQueries(
+          { id: "order-1", total: 1999, status: "partially_refunded" },
+          calls
+        );
+        refundTransaction(1000, calls);
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 9.99 });
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(999);
+      });
+
+      it("marks a partial refund as partially_refunded, not refunded", async () => {
+        const calls: string[] = [];
+        routeQueries({ id: "order-1", total: 1999, status: "paid" }, calls);
+        refundTransaction(0, calls);
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 5 });
+        expect(res.status).toBe(200);
+        const orderUpdate = calls.find((c) => c.includes("UPDATE orders"));
+        expect(orderUpdate).toBeDefined();
+        expect(orderUpdate).toContain("'partially_refunded'");
+        expect(orderUpdate).not.toMatch(/SET status = 'refunded'/);
+      });
+
+      it("records the refund as pending before calling the processor, then succeeded", async () => {
+        const calls: string[] = [];
+        routeQueries({ id: "order-1", total: 1999, status: "paid" }, calls);
+        refundTransaction(0, calls);
+        mockedRefundProcessor.mockImplementationOnce(async () => {
+          calls.push("processor");
+        });
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 19.99 });
+        expect(res.status).toBe(200);
+
+        const insertIdx = calls.findIndex(
+          (c) => c.startsWith("tx:") && c.includes("INSERT INTO refunds")
+        );
+        const processorIdx = calls.indexOf("processor");
+        const succeededIdx = calls.findIndex(
+          (c) => c.includes("UPDATE refunds") && c.includes("'succeeded'")
+        );
+        expect(calls[insertIdx]).toContain("'pending'");
+        expect(insertIdx).toBeGreaterThanOrEqual(0);
+        expect(processorIdx).toBeGreaterThan(insertIdx);
+        expect(succeededIdx).toBeGreaterThan(processorIdx);
+        // The processor is never called from inside the transaction callback.
+        expect(calls[succeededIdx].startsWith("q:")).toBe(true);
+      });
+
+      it("marks the refund failed and returns 402 when the processor declines", async () => {
+        const calls: string[] = [];
+        routeQueries({ id: "order-1", total: 1999, status: "paid" }, calls);
+        refundTransaction(0, calls);
+        mockedRefundProcessor.mockRejectedValueOnce(
+          new ProcessorError("declined")
+        );
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 5 });
+        expect(res.status).toBe(402);
+        expect(
+          calls.some(
+            (c) => c.includes("UPDATE refunds") && c.includes("'failed'")
+          )
+        ).toBe(true);
+        expect(calls.some((c) => c.includes("UPDATE orders"))).toBe(false);
+      });
     });
   });
 

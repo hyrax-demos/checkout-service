@@ -24,7 +24,15 @@ export interface Refund {
   id: string;
   orderId: string;
   amount: number; // cents
+  status: RefundStatus;
   createdAt: string;
 }
 
-export type OrderStatus = "pending" | "paid" | "cancelled" | "refunded";
+export type OrderStatus =
+  | "pending"
+  | "paid"
+  | "cancelled"
+  | "partially_refunded"
+  | "refunded";
+
+export type RefundStatus = "pending" | "succeeded" | "failed";
