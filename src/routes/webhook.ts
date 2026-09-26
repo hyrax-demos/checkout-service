@@ -2,6 +2,7 @@ import { Router, Request, Response, raw } from "express";
 import { query, sql } from "../db";
 import { config } from "../config";
 import { checkTimestamp, verifySignature } from "../utils/webhookSignature";
+import { processedEvents } from "../processedEvents";
 
 export const webhook = Router();
 
@@ -52,7 +53,17 @@ webhook.post(
     if (!event || typeof event !== "object" || !event.data || typeof event.data !== "object") {
       return res.status(400).json({ error: "malformed event" });
     }
+    if (typeof event.id !== "string" || event.id.length === 0) {
+      return res.status(400).json({ error: "missing event id" });
+    }
 
+    // (4) Replay: an already-processed event is acknowledged without
+    // re-running any side effects.
+    if (await processedEvents.has(event.id)) {
+      return res.json({ received: true, duplicate: true });
+    }
+
+    // (5) Handle the event.
     switch (event.type) {
       case "charge.succeeded":
         await query(
@@ -72,6 +83,10 @@ webhook.post(
         );
         break;
     }
+
+    // (6) Record the id only after handling succeeded, so a failed attempt
+    // (handler threw) stays retryable by the processor.
+    await processedEvents.add(event.id);
 
     res.json({ received: true });
   }

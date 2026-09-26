@@ -12,6 +12,7 @@ vi.mock("../src/db", () => ({
 }));
 
 import { query } from "../src/db";
+import { processedEvents } from "../src/processedEvents";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -55,9 +56,10 @@ const chargeSucceeded = {
 describe("processor webhook", () => {
   const app = buildApp();
 
-  beforeEach(() => {
+  beforeEach(async () => {
     mockedQuery.mockReset();
     mockedQuery.mockResolvedValue([]);
+    await processedEvents.clear();
   });
 
   it("accepts a correctly signed, fresh charge.succeeded event", async () => {
@@ -126,6 +128,25 @@ describe("processor webhook", () => {
 
   it("rejects a signed but malformed JSON body with 400", async () => {
     const res = await sendEvent(app, "{not json");
+    expect(res.status).toBe(400);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges a replayed event without re-processing it", async () => {
+    const first = await sendEvent(app, chargeSucceeded);
+    expect(first.status).toBe(200);
+    expect(first.body).toEqual({ received: true });
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+
+    const replay = await sendEvent(app, chargeSucceeded);
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual({ received: true, duplicate: true });
+    // The order update ran exactly once across both deliveries.
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a signed event with no id with 400", async () => {
+    const res = await sendEvent(app, { type: "charge.succeeded", data: { orderId: "order-1" } });
     expect(res.status).toBe(400);
     expect(mockedQuery).not.toHaveBeenCalled();
   });
