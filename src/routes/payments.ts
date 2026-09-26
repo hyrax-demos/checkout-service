@@ -51,12 +51,29 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // the agent as a dollar value.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
+  if (
+    typeof amountDollars !== "number" ||
+    !Number.isFinite(amountDollars) ||
+    amountDollars <= 0
+  ) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
 
+  // The processor's API (like our `Order.total`) takes integer cents, so
+  // convert the storefront's dollar value to minor units. Rounding absorbs
+  // floating-point artifacts (e.g. 19.99 * 100 = 1998.9999...), but a value
+  // with a genuine sub-cent fraction (e.g. 1.005) is rejected rather than
+  // silently rounded to a different amount than the caller asked for.
+  const scaled = amountDollars * 100;
+  const amountCents = Math.round(scaled);
+  if (Math.abs(scaled - amountCents) > 1e-6) {
+    return res
+      .status(400)
+      .json({ error: "amountDollars must be a whole number of cents" });
+  }
+
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
@@ -65,8 +82,6 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   if (order.status === "cancelled" || order.status === "pending") {
     return res.status(409).json({ error: "order is not refundable" });
   }
-
-  const amountCents = Math.round(amountDollars * 100);
 
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
@@ -77,7 +92,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   await withTransaction(async (client) => {
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents,
       apiKey: config.paymentApiKey,
     });
     await client.query(
@@ -120,4 +135,44 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
   });
 
   res.json({ ok: true, captured });
+});
+
+interface RefundRow {
+  id: string;
+  amount: number | string; // cents; pg returns BIGINT/NUMERIC as a string
+  created_at: Date | string;
+}
+
+// List the refunds issued against one of the authenticated customer's orders,
+// newest first, along with how much of the order total is still refundable.
+// Responds 404 for an order the caller does not own so it is not possible to
+// probe for another customer's order ids.
+payments.get("/orders/:id/refunds", async (req: AuthedRequest, res: Response) => {
+  const orders = await query<Order>(
+    sql`SELECT id, total, status FROM orders WHERE id = ${req.params.id} AND customer_id = ${req.userId}`
+  );
+  const order = orders[0];
+  if (!order) {
+    return res.status(404).json({ error: "order not found" });
+  }
+
+  const rows = await query<RefundRow>(
+    sql`SELECT id, amount, created_at FROM refunds WHERE order_id = ${order.id} ORDER BY created_at DESC, id DESC`
+  );
+
+  // Normalise and sort again here so the response order is well-defined
+  // however the rows arrive (Array.prototype.sort is stable, so equal
+  // timestamps keep the database's tie-break order).
+  const refunds = rows
+    .map((r) => ({
+      id: r.id,
+      amount: Number(r.amount), // cents
+      created_at: new Date(r.created_at).toISOString(),
+    }))
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+
+  const refunded = refunds.reduce((sum, r) => sum + r.amount, 0);
+  const remaining = Number(order.total) - refunded; // cents
+
+  res.json({ orderId: order.id, refunds, remaining });
 });
