@@ -29,7 +29,14 @@ orders.get("/orders", async (req: AuthedRequest, res: Response) => {
 
 // Create a new order for the authenticated customer.
 orders.post("/orders", async (req: AuthedRequest, res: Response) => {
-  const { total, items } = req.body;
+  const { total, items } = req.body ?? {};
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "items must be a non-empty array" });
+  }
+  // Totals are integer cents; reject fractions, non-numbers, and non-positive values.
+  if (!Number.isSafeInteger(total) || total <= 0) {
+    return res.status(400).json({ error: "total must be a positive integer number of cents" });
+  }
   const reference = generateOrderReference();
   const rows = await query<Order>(
     sql`INSERT INTO orders (customer_id, total, items, reference, status)
