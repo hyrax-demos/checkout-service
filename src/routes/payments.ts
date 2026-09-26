@@ -51,8 +51,25 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // the agent as a dollar value.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
+  if (
+    typeof amountDollars !== "number" ||
+    !Number.isFinite(amountDollars) ||
+    amountDollars <= 0
+  ) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
+  }
+
+  // The processor's API (like our `Order.total`) takes integer cents, so
+  // convert the storefront's dollar value to minor units. Rounding absorbs
+  // floating-point artifacts (e.g. 19.99 * 100 = 1998.9999...), but a value
+  // with a genuine sub-cent fraction (e.g. 1.005) is rejected rather than
+  // silently rounded to a different amount than the caller asked for.
+  const scaled = amountDollars * 100;
+  const amountCents = Math.round(scaled);
+  if (Math.abs(scaled - amountCents) > 1e-6) {
+    return res
+      .status(400)
+      .json({ error: "amountDollars must be a whole number of cents" });
   }
 
   const rows = await query<Order>(
@@ -65,13 +82,6 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   if (order.status === "cancelled" || order.status === "pending") {
     return res.status(409).json({ error: "order is not refundable" });
   }
-
-  // The processor's API (like our `Order.total`) takes integer cents, so
-  // convert the storefront's dollar value to minor units. Rounding avoids
-  // floating-point artifacts (e.g. 19.99 * 100 = 1998.9999...) and keeps the
-  // amount comparable against `order.total` and consistent with the stored
-  // refund row.
-  const amountCents = Math.round(amountDollars * 100);
 
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {

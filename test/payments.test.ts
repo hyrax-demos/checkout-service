@@ -98,6 +98,17 @@ describe("payments routes", () => {
       expect(res.status).toBe(400);
     });
 
+    it("rejects an amount that is not a whole number of cents", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 1.005 });
+      expect(res.status).toBe(400);
+      expect(mockedQuery).not.toHaveBeenCalled();
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
     it("returns 404 when no order has that reference", async () => {
       mockedQuery.mockResolvedValueOnce([]);
       const res = await request(app)
