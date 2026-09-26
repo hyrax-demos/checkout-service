@@ -27,6 +27,7 @@ The service listens on `:3000` by default.
 | GET    | `/health`                   | Liveness check                       |
 | GET    | `/orders/:id`               | Fetch a single order                 |
 | GET    | `/orders`                   | List the caller's orders             |
+| GET    | `/orders/:id/refunds`       | List an order's refunds + remaining  |
 | POST   | `/orders`                   | Create an order                      |
 | POST   | `/payments/charge`          | Capture payment for an order         |
 | POST   | `/payments/capture-batch`   | Capture several orders at once       |

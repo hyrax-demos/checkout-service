@@ -149,6 +149,54 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   res.json({ refunded: true, refundId, amount: amountCents });
 });
 
+// List the refunds recorded against one of the caller's orders, newest first,
+// along with how much of the order can still be refunded.
+//
+// Response shape:
+//   404 { error: string } when the order does not exist or is not the caller's.
+//   200 {
+//     orderId: string,
+//     refunds: { id: string; amount: number; status: "succeeded"; created_at: string }[],
+//     remainingRefundable: number, // cents
+//   }
+// A refund row is only written after the processor accepts the refund (see
+// POST /refunds), so every recorded refund has succeeded. `remainingRefundable`
+// follows the same rules POST /refunds enforces: zero for orders that cannot be
+// refunded (pending / cancelled), otherwise the total less all recorded refunds.
+payments.get("/orders/:id/refunds", async (req: AuthedRequest, res: Response) => {
+  // Scoped to the caller: another customer's order is indistinguishable from a
+  // nonexistent one (404, not 403).
+  const orderRows = await query<Order>(
+    sql`SELECT id, total, status FROM orders WHERE id = ${req.params.id} AND customer_id = ${req.userId}`
+  );
+  const order = orderRows[0];
+  if (!order) {
+    return res.status(404).json({ error: "order not found" });
+  }
+
+  const refundRows = await query<{
+    id: string;
+    amount: string | number;
+    created_at: string | Date;
+  }>(
+    sql`SELECT id, amount, created_at FROM refunds WHERE order_id = ${order.id} ORDER BY created_at DESC, id DESC`
+  );
+
+  const refunds = refundRows.map((row) => ({
+    id: row.id,
+    amount: Number(row.amount), // cents
+    status: "succeeded" as const,
+    created_at:
+      row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  }));
+
+  const refunded = refunds.reduce((sum, refund) => sum + refund.amount, 0);
+  const refundable = order.status !== "cancelled" && order.status !== "pending";
+  const remainingRefundable = refundable ? Math.max(0, order.total - refunded) : 0;
+
+  res.json({ orderId: order.id, refunds, remainingRefundable });
+});
+
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
 //

@@ -339,6 +339,134 @@ describe("payments routes", () => {
     });
   });
 
+  describe("GET /orders/:id/refunds", () => {
+    type Q = { text: string; values: unknown[] };
+
+    // Route pool-level queries by SQL text. The order lookup only returns the
+    // order to a query scoped to its real owner; the refund lookup returns
+    // `refunds` as the database would (already ordered by the query).
+    function routeQueries(
+      order: { id: string; customer_id: string; total: number; status: string },
+      refunds: { id: string; amount: number | string; created_at: string }[]
+    ) {
+      mockedQuery.mockImplementation(async (q: Q) => {
+        if (q.text.includes("FROM orders")) {
+          if (!q.values.includes(order.id)) return [];
+          if (!q.text.includes("customer_id")) return [order];
+          return q.values.includes(order.customer_id) ? [order] : [];
+        }
+        if (q.text.includes("FROM refunds")) {
+          return q.values.includes(order.id) ? refunds : [];
+        }
+        return [];
+      });
+    }
+
+    const ownOrder = {
+      id: "order-1",
+      customer_id: "user-1",
+      total: 1999,
+      status: "partially_refunded",
+    };
+
+    it("returns 404 for another customer's order without reading its refunds", async () => {
+      routeQueries(
+        { ...ownOrder, id: "order-2", customer_id: "user-2" },
+        [{ id: "refund-x", amount: 500, created_at: "2026-09-01T00:00:00.000Z" }]
+      );
+      const res = await request(app)
+        .get("/orders/order-2/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+      expect(res.body.refunds).toBeUndefined();
+      const lookup = mockedQuery.mock.calls[0][0] as Q;
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
+      const texts = mockedQuery.mock.calls.map((c) => (c[0] as Q).text);
+      expect(texts.some((t) => t.includes("FROM refunds"))).toBe(false);
+    });
+
+    it("returns 404 when the order does not exist", async () => {
+      routeQueries(ownOrder, []);
+      const res = await request(app)
+        .get("/orders/order-missing/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+    });
+
+    it("requires authentication", async () => {
+      const res = await request(app).get("/orders/order-1/refunds");
+      expect(res.status).toBe(401);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("lists the order's refunds newest first", async () => {
+      routeQueries(ownOrder, [
+        { id: "refund-3", amount: "200", created_at: "2026-09-03T00:00:00.000Z" },
+        { id: "refund-2", amount: "300", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: "500", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      const refundQuery = mockedQuery.mock.calls
+        .map((c) => c[0] as Q)
+        .find((q) => q.text.includes("FROM refunds"))!;
+      expect(refundQuery.text).toMatch(/ORDER BY created_at DESC/);
+      expect(refundQuery.values).toContain("order-1");
+      expect(res.body.refunds).toEqual([
+        { id: "refund-3", amount: 200, status: "succeeded", created_at: "2026-09-03T00:00:00.000Z" },
+        { id: "refund-2", amount: 300, status: "succeeded", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: 500, status: "succeeded", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+    });
+
+    it("reports the remaining refundable amount after partial refunds", async () => {
+      routeQueries(ownOrder, [
+        { id: "refund-2", amount: "499", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: "1000", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.orderId).toBe("order-1");
+      expect(res.body.remainingRefundable).toBe(500);
+    });
+
+    it("reports the full total as remaining for a paid order with no refunds", async () => {
+      routeQueries({ ...ownOrder, status: "paid" }, []);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.refunds).toEqual([]);
+      expect(res.body.remainingRefundable).toBe(1999);
+    });
+
+    it("reports zero remaining once the order is fully refunded", async () => {
+      routeQueries({ ...ownOrder, status: "refunded" }, [
+        { id: "refund-2", amount: 999, created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: 1000, created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.remainingRefundable).toBe(0);
+    });
+
+    it("reports zero remaining for an order that is not refundable", async () => {
+      routeQueries({ ...ownOrder, status: "pending" }, []);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.remainingRefundable).toBe(0);
+    });
+  });
+
   describe("POST /payments/capture-batch", () => {
     it("rejects an empty orderIds array", async () => {
       const res = await request(app)
