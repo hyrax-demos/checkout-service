@@ -13,9 +13,11 @@ export function generateOrderReference(): string {
 
 // Build the idempotency key sent to the processor with a charge attempt. The
 // processor collapses charges that share a key, so retries of the same attempt
-// do not double-charge the customer.
+// do not double-charge the customer. The key must therefore be a pure function
+// of the order id: embedding a timestamp or random value would give every
+// retry a fresh key and defeat the processor's deduplication.
 export function chargeIdempotencyKey(orderId: string): string {
-  return `charge_${orderId}_${Date.now().toString(36)}`;
+  return `charge_${orderId}`;
 }
 
 // Generate an internal identifier (e.g. for a refund row).
