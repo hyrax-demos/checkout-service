@@ -1,7 +1,7 @@
 import { Router, Request, Response, raw } from "express";
-import { createHmac, timingSafeEqual } from "crypto";
 import { query, sql } from "../db";
 import { config } from "../config";
+import { checkTimestamp, verifySignature } from "../utils/webhookSignature";
 
 export const webhook = Router();
 
@@ -15,31 +15,43 @@ interface ProcessorEvent {
   };
 }
 
-// Verify the processor's HMAC signature over the raw request body.
-function signatureValid(rawBody: Buffer, signature: string): boolean {
-  const expected = createHmac("sha256", config.webhookSecret)
-    .update(rawBody)
-    .digest("hex");
-  const a = Buffer.from(signature, "hex");
-  const b = Buffer.from(expected, "hex");
-  return a.length === b.length && timingSafeEqual(a, b);
+function headerValue(req: Request, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
 }
 
 // Receive asynchronous status updates from the payment processor. The body is
-// read as a raw buffer so the signature can be checked against the exact bytes
-// the processor signed.
+// read as a raw buffer (whatever the content type) so the signature can be
+// checked against the exact bytes the processor signed. This router is mounted
+// before the global JSON parser and the raw parser is scoped to this route, so
+// other routes are unaffected.
 webhook.post(
   "/webhooks/processor",
-  raw({ type: "application/json" }),
+  raw({ type: "*/*" }),
   async (req: Request, res: Response) => {
-    const signature = String(req.headers["x-processor-signature"] ?? "");
-    const rawBody = req.body as Buffer;
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
-    if (!signature || !signatureValid(rawBody, signature)) {
-      return res.status(400).json({ error: "invalid signature" });
+    // (1) Signature: missing or invalid → 401.
+    const signature = headerValue(req, "x-webhook-signature");
+    if (!verifySignature(rawBody, signature, config.webhookSecret)) {
+      return res.status(401).json({ error: "invalid signature" });
     }
 
-    const event = JSON.parse(rawBody.toString("utf8")) as ProcessorEvent;
+    // (2) Timestamp: missing, malformed or outside the window → 400.
+    if (checkTimestamp(headerValue(req, "x-webhook-timestamp")) !== "ok") {
+      return res.status(400).json({ error: "invalid or stale timestamp" });
+    }
+
+    // (3) Parse the event from the verified raw bytes.
+    let event: ProcessorEvent;
+    try {
+      event = JSON.parse(rawBody.toString("utf8")) as ProcessorEvent;
+    } catch {
+      return res.status(400).json({ error: "malformed JSON body" });
+    }
+    if (!event || typeof event !== "object" || !event.data || typeof event.data !== "object") {
+      return res.status(400).json({ error: "malformed event" });
+    }
 
     switch (event.type) {
       case "charge.succeeded":
