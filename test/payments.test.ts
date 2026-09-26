@@ -93,6 +93,36 @@ describe("payments routes", () => {
       expect(res.status).toBe(404);
     });
 
+    it("returns 404 for another customer's order reference", async () => {
+      // Fake DB holding one paid order "ord_other" owned by user-2. Like a real
+      // WHERE clause, it returns the row for an unscoped reference lookup, or
+      // one scoped to user-2 -- but not one scoped to the caller (user-1).
+      mockedQuery.mockImplementation(
+        async (q: { text: string; values: unknown[] }) => {
+          const matchesOrder =
+            q.text.includes("FROM orders") && q.values.includes("ord_other");
+          const scopedToOwner =
+            !q.text.includes("customer_id") || q.values.includes("user-2");
+          if (matchesOrder && scopedToOwner) {
+            return [{ id: "order-2", total: 1999, status: "paid" }];
+          }
+          return [];
+        }
+      );
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_other", amountDollars: 5 });
+      expect(res.status).toBe(404);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      const lookup = mockedQuery.mock.calls[0][0] as {
+        text: string;
+        values: unknown[];
+      };
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
+    });
+
     it("returns 409 for an order that cannot be refunded", async () => {
       mockedQuery.mockResolvedValueOnce([
         { id: "order-1", total: 1999, status: "pending" },

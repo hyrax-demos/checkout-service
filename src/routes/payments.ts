@@ -56,7 +56,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   }
 
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
