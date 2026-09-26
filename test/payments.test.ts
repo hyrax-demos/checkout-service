@@ -11,8 +11,30 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import {
+  chargeProcessor,
+  refundProcessor,
+  ProcessorError,
+} from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
+
+const mockedChargeProcessor = chargeProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -35,6 +57,8 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
+    mockedChargeProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -84,6 +108,18 @@ describe("payments routes", () => {
       expect(res.status).toBe(400);
     });
 
+    it("rejects an amount that is not a whole number of cents", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 1.005 });
+      expect(res.status).toBe(400);
+      // Rejected before any lookup or processor call.
+      expect(mockedQuery).not.toHaveBeenCalled();
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
     it("returns 404 when no order has that reference", async () => {
       mockedQuery.mockResolvedValueOnce([]);
       const res = await request(app)
@@ -91,6 +127,45 @@ describe("payments routes", () => {
         .set("Authorization", `Bearer ${token}`)
         .send({ reference: "ord_missing", amountDollars: 5 });
       expect(res.status).toBe(404);
+    });
+
+    it("returns 404 for another customer's order reference", async () => {
+      // A paid order owned by user-2. The fake only returns it to a lookup
+      // that is either unscoped (the bug) or scoped to its real owner.
+      const otherCustomersOrder = {
+        id: "order-2",
+        customer_id: "user-2",
+        total: 1999,
+        status: "paid",
+      };
+      mockedQuery.mockImplementation(
+        async (q: { text: string; values: unknown[] }) => {
+          if (!q.text.includes("FROM orders")) return [];
+          if (!q.values.includes("ord_other")) return [];
+          if (
+            q.text.includes("customer_id") &&
+            !q.values.includes(otherCustomersOrder.customer_id)
+          ) {
+            return [];
+          }
+          return [otherCustomersOrder];
+        }
+      );
+      fakeTransaction();
+
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_other", amountDollars: 19.99 });
+
+      expect(res.status).toBe(404);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      const lookup = mockedQuery.mock.calls[0][0] as {
+        text: string;
+        values: unknown[];
+      };
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
     });
 
     it("returns 409 for an order that cannot be refunded", async () => {
@@ -127,6 +202,269 @@ describe("payments routes", () => {
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
     });
+
+    it("passes the refund amount to the processor in cents", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ orderId: "order-1", amount: 1999 })
+      );
+    });
+  });
+
+  describe("POST /refunds cumulative refund limits", () => {
+    const paidOrder = { id: "order-1", total: 1999, status: "paid" };
+
+    // Route the pool-level queries by SQL text: the order lookup returns the
+    // given order, the refund-ledger sum returns `priorRefunded`.
+    function routeQueries(order: object, priorRefunded: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) return [order];
+        if (q.text.includes("FROM refunds")) {
+          return [{ refunded: String(priorRefunded) }];
+        }
+        return [];
+      });
+    }
+
+    // A transaction client whose refund-ledger sum returns `lockedRefunded`
+    // (what the ledger holds once the order row is locked).
+    function ledgerTransaction(lockedRefunded: number) {
+      const client = {
+        query: vi.fn(async (q: { text: string }) => {
+          if (q.text.includes("FROM refunds")) {
+            return [{ refunded: String(lockedRefunded) }];
+          }
+          return [];
+        }),
+      };
+      mockedWithTransaction.mockImplementationOnce(async (fn: any) => fn(client));
+      return client;
+    }
+
+    function statusUpdate(client: { query: ReturnType<typeof vi.fn> }) {
+      const call = client.query.mock.calls
+        .map((c) => c[0] as { text: string; values: unknown[] })
+        .find((q) => q.text.includes("UPDATE orders SET status"));
+      return call;
+    }
+
+    it("rejects a refund that exceeds the remaining amount after prior refunds", async () => {
+      routeQueries(paidOrder, 1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("marks the order partially_refunded after a partial refund", async () => {
+      routeQueries(paidOrder, 0);
+      const client = ledgerTransaction(0);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(500);
+      const update = statusUpdate(client);
+      expect(update).toBeDefined();
+      expect(update!.values).toContain("partially_refunded");
+      expect(update!.values).not.toContain("refunded");
+    });
+
+    it("allows a second partial refund on a partially refunded order", async () => {
+      routeQueries({ ...paidOrder, status: "partially_refunded" }, 500);
+      const client = ledgerTransaction(500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(statusUpdate(client)!.values).toContain("partially_refunded");
+    });
+
+    it("marks the order refunded once prior + current refunds reach the total", async () => {
+      routeQueries({ ...paidOrder, status: "partially_refunded" }, 1500);
+      const client = ledgerTransaction(1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 4.99 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(499);
+      expect(statusUpdate(client)!.values).toContain("refunded");
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 499 })
+      );
+    });
+
+    it("rejects any refund on a fully refunded order", async () => {
+      routeQueries({ ...paidOrder, status: "refunded" }, 1999);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 0.01 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("re-checks the ledger under the order lock and rejects a concurrent over-refund", async () => {
+      // The pre-check sees no prior refunds, but by the time the order row is
+      // locked a concurrent request has recorded 1500 cents.
+      routeQueries(paidOrder, 0);
+      const client = ledgerTransaction(1500);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 10 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      const texts = client.query.mock.calls.map((c) => (c[0] as { text: string }).text);
+      expect(texts.some((t) => t.includes("FOR UPDATE"))).toBe(true);
+      expect(texts.some((t) => t.includes("INSERT INTO refunds"))).toBe(false);
+    });
+  });
+
+  describe("GET /orders/:id/refunds", () => {
+    type Q = { text: string; values: unknown[] };
+
+    // Route pool-level queries by SQL text. The order lookup only returns the
+    // order to a query scoped to its real owner; the refund lookup returns
+    // `refunds` as the database would (already ordered by the query).
+    function routeQueries(
+      order: { id: string; customer_id: string; total: number; status: string },
+      refunds: { id: string; amount: number | string; created_at: string }[]
+    ) {
+      mockedQuery.mockImplementation(async (q: Q) => {
+        if (q.text.includes("FROM orders")) {
+          if (!q.values.includes(order.id)) return [];
+          if (!q.text.includes("customer_id")) return [order];
+          return q.values.includes(order.customer_id) ? [order] : [];
+        }
+        if (q.text.includes("FROM refunds")) {
+          return q.values.includes(order.id) ? refunds : [];
+        }
+        return [];
+      });
+    }
+
+    const ownOrder = {
+      id: "order-1",
+      customer_id: "user-1",
+      total: 1999,
+      status: "partially_refunded",
+    };
+
+    it("returns 404 for another customer's order without reading its refunds", async () => {
+      routeQueries(
+        { ...ownOrder, id: "order-2", customer_id: "user-2" },
+        [{ id: "refund-x", amount: 500, created_at: "2026-09-01T00:00:00.000Z" }]
+      );
+      const res = await request(app)
+        .get("/orders/order-2/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+      expect(res.body.refunds).toBeUndefined();
+      const lookup = mockedQuery.mock.calls[0][0] as Q;
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
+      const texts = mockedQuery.mock.calls.map((c) => (c[0] as Q).text);
+      expect(texts.some((t) => t.includes("FROM refunds"))).toBe(false);
+    });
+
+    it("returns 404 when the order does not exist", async () => {
+      routeQueries(ownOrder, []);
+      const res = await request(app)
+        .get("/orders/order-missing/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(404);
+    });
+
+    it("requires authentication", async () => {
+      const res = await request(app).get("/orders/order-1/refunds");
+      expect(res.status).toBe(401);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("lists the order's refunds newest first", async () => {
+      routeQueries(ownOrder, [
+        { id: "refund-3", amount: "200", created_at: "2026-09-03T00:00:00.000Z" },
+        { id: "refund-2", amount: "300", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: "500", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      const refundQuery = mockedQuery.mock.calls
+        .map((c) => c[0] as Q)
+        .find((q) => q.text.includes("FROM refunds"))!;
+      expect(refundQuery.text).toMatch(/ORDER BY created_at DESC/);
+      expect(refundQuery.values).toContain("order-1");
+      expect(res.body.refunds).toEqual([
+        { id: "refund-3", amount: 200, status: "succeeded", created_at: "2026-09-03T00:00:00.000Z" },
+        { id: "refund-2", amount: 300, status: "succeeded", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: 500, status: "succeeded", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+    });
+
+    it("reports the remaining refundable amount after partial refunds", async () => {
+      routeQueries(ownOrder, [
+        { id: "refund-2", amount: "499", created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: "1000", created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.orderId).toBe("order-1");
+      expect(res.body.remainingRefundable).toBe(500);
+    });
+
+    it("reports the full total as remaining for a paid order with no refunds", async () => {
+      routeQueries({ ...ownOrder, status: "paid" }, []);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.refunds).toEqual([]);
+      expect(res.body.remainingRefundable).toBe(1999);
+    });
+
+    it("reports zero remaining once the order is fully refunded", async () => {
+      routeQueries({ ...ownOrder, status: "refunded" }, [
+        { id: "refund-2", amount: 999, created_at: "2026-09-02T00:00:00.000Z" },
+        { id: "refund-1", amount: 1000, created_at: "2026-09-01T00:00:00.000Z" },
+      ]);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.remainingRefundable).toBe(0);
+    });
+
+    it("reports zero remaining for an order that is not refundable", async () => {
+      routeQueries({ ...ownOrder, status: "pending" }, []);
+      const res = await request(app)
+        .get("/orders/order-1/refunds")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.remainingRefundable).toBe(0);
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
@@ -151,6 +489,134 @@ describe("payments routes", () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.captured.sort()).toEqual(["order-1", "order-2"]);
+    });
+
+    function chargedOrderKeys() {
+      return mockedChargeProcessor.mock.calls.map(
+        (c) => (c[0] as { idempotencyKey: string }).idempotencyKey
+      );
+    }
+
+    function paidUpdates() {
+      return mockedQuery.mock.calls
+        .map((c) => c[0] as { text: string; values: unknown[] })
+        .filter((q) => q.text.includes("UPDATE orders SET status = 'paid'"))
+        .map((q) => q.values[0]);
+    }
+
+    it("skips orders that are not pending", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "paid" },
+        { id: "order-3", total: 900, status: "cancelled" },
+        { id: "order-4", total: 300, status: "refunded" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2", "order-3", "order-4"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.failed).toEqual([]);
+      expect(res.body.skipped.map((s: { orderId: string }) => s.orderId)).toEqual([
+        "order-2",
+        "order-3",
+        "order-4",
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedChargeProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 500 })
+      );
+      expect(paidUpdates()).toEqual(["order-1"]);
+    });
+
+    it("charges orders sequentially, one at a time", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+        { id: "order-3", total: 900, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      let inFlight = 0;
+      let maxInFlight = 0;
+      mockedChargeProcessor.mockImplementation(async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight -= 1;
+      });
+      try {
+        const res = await request(app)
+          .post("/payments/capture-batch")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ orderIds: ["order-1", "order-2", "order-3"] });
+        expect(res.status).toBe(200);
+        expect(res.body.captured).toEqual(["order-1", "order-2", "order-3"]);
+        expect(maxInFlight).toBe(1);
+      } finally {
+        mockedChargeProcessor.mockImplementation(async () => {});
+      }
+    });
+
+    it("uses a per-order idempotency key for each charge", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2"] });
+      const keys = chargedOrderKeys();
+      expect(keys).toHaveLength(2);
+      expect(keys[0]).toContain("order-1");
+      expect(keys[1]).toContain("order-2");
+    });
+
+    it("reports failed captures and continues with the rest of the batch", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+        { id: "order-2", total: 700, status: "pending" },
+        { id: "order-3", total: 900, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      mockedChargeProcessor
+        .mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => {
+          throw new ProcessorError("card declined");
+        })
+        .mockImplementationOnce(async () => {});
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-2", "order-3"] });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(false);
+      expect(res.body.captured).toEqual(["order-1", "order-3"]);
+      expect(res.body.failed).toEqual([
+        { orderId: "order-2", error: "payment declined" },
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(3);
+      expect(paidUpdates()).toEqual(["order-1", "order-3"]);
+    });
+
+    it("reports orders that are not found for the caller as failed", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1", "order-x"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual(["order-1"]);
+      expect(res.body.failed).toEqual([
+        { orderId: "order-x", error: "order not found" },
+      ]);
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(1);
     });
   });
 });

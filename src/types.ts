@@ -27,4 +27,9 @@ export interface Refund {
   createdAt: string;
 }
 
-export type OrderStatus = "pending" | "paid" | "cancelled" | "refunded";
+export type OrderStatus =
+  | "pending"
+  | "paid"
+  | "cancelled"
+  | "partially_refunded"
+  | "refunded";

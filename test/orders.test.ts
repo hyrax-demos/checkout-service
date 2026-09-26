@@ -90,4 +90,42 @@ describe("orders routes", () => {
     expect(res.status).toBe(201);
     expect(res.body).toMatchObject({ id: "order-new", status: "pending" });
   });
+
+  describe("POST /orders validation", () => {
+    const items = [{ sku: "sku-1", quantity: 1, unitPrice: 500 }];
+
+    const invalidBodies: Array<[string, unknown]> = [
+      ["missing items", { total: 500 }],
+      ["empty items array", { total: 500, items: [] }],
+      ["items not an array", { total: 500, items: { sku: "sku-1" } }],
+      ["items as a string", { total: 500, items: "sku-1" }],
+      ["missing total", { items }],
+      ["zero total", { total: 0, items }],
+      ["negative total", { total: -100, items }],
+      ["fractional total", { total: 19.99, items }],
+      ["string total", { total: "1000", items }],
+      ["null total", { total: null, items }],
+      ["unsafe integer total", { total: Number.MAX_SAFE_INTEGER + 1, items }],
+    ];
+
+    it.each(invalidBodies)("rejects %s with 400 and does not insert", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body as object);
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("error");
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("accepts a positive integer total with non-empty items", async () => {
+      mockedQuery.mockResolvedValueOnce([{ id: "order-ok", total: 500, items, status: "pending" }]);
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ total: 500, items });
+      expect(res.status).toBe(201);
+      expect(mockedQuery).toHaveBeenCalledTimes(1);
+    });
+  });
 });

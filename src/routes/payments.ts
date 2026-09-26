@@ -3,7 +3,7 @@ import { query, sql, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
-import { Order } from "../types";
+import { Order, OrderStatus } from "../types";
 import {
   chargeProcessor,
   refundProcessor,
@@ -11,6 +11,35 @@ import {
 } from "../processor";
 
 export const payments = Router();
+
+// Raised inside the refund transaction when the ledger, re-read under the
+// order row lock, shows the requested amount exceeds what remains refundable.
+class RefundExceedsRemainingError extends Error {}
+
+// Normalise a `COALESCE(SUM(amount), 0) AS refunded` result to integer cents.
+// pg returns SUM over integer columns as a string (bigint/numeric).
+function refundedCents(rows: { refunded: string | number | null }[]): number {
+  const value = rows[0]?.refunded;
+  return value == null ? 0 : Number(value);
+}
+
+// Convert a client-supplied dollar amount to integer cents, or return null if
+// it is not a positive, finite amount expressible in whole cents (e.g. 1.005).
+// `x * 100` carries binary floating-point noise (19.99 * 100 is
+// 1998.9999999999998), so accept values within a tiny epsilon of an integer
+// rather than requiring exact integrality, and never silently round a genuine
+// sub-cent fraction.
+function parseDollarsToCents(amountDollars: unknown): number | null {
+  if (typeof amountDollars !== "number" || !Number.isFinite(amountDollars) || amountDollars <= 0) {
+    return null;
+  }
+  const scaled = amountDollars * 100;
+  const cents = Math.round(scaled);
+  if (Math.abs(scaled - cents) > 1e-6 || !Number.isSafeInteger(cents) || cents <= 0) {
+    return null;
+  }
+  return cents;
+}
 
 // Capture payment for an order against the upstream processor.
 payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
@@ -51,12 +80,17 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // the agent as a dollar value.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
-    return res.status(400).json({ error: "amountDollars must be a positive number" });
+  const amountCents = parseDollarsToCents(amountDollars);
+  if (amountCents === null) {
+    return res
+      .status(400)
+      .json({ error: "amountDollars must be a positive amount in whole cents" });
   }
 
+  // Scope the lookup to the caller: another customer's reference is
+  // indistinguishable from a nonexistent one (404, not 403).
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
@@ -66,33 +100,116 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
-  const amountCents = Math.round(amountDollars * 100);
-
-  // A refund may not exceed the order's captured total.
-  if (amountCents > order.total) {
-    return res.status(422).json({ error: "refund exceeds order total" });
+  // Fast path: reject against the refunds already recorded for this order so
+  // a request that obviously over-refunds never reaches the transaction. The
+  // authoritative check is repeated under a row lock below.
+  const priorRows = await query<{ refunded: string | number | null }>(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${order.id}`
+  );
+  if (amountCents > order.total - refundedCents(priorRows)) {
+    return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountDollars,
-      apiKey: config.paymentApiKey,
+  try {
+    await withTransaction(async (client) => {
+      // Serialise refunds per order: lock the order row, then re-read the
+      // refund ledger so two concurrent partial refunds cannot both pass the
+      // check against the same prior total.
+      await client.query(sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`);
+      const lockedRows = await client.query<{ refunded: string | number | null }>(
+        sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${order.id}`
+      );
+      const alreadyRefunded = refundedCents(lockedRows);
+      if (amountCents > order.total - alreadyRefunded) {
+        throw new RefundExceedsRemainingError();
+      }
+
+      await refundProcessor({
+        orderId: order.id,
+        amount: amountCents, // cents, like every other processor call
+        apiKey: config.paymentApiKey,
+      });
+      await client.query(
+        sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
+      );
+      const nextStatus: OrderStatus =
+        alreadyRefunded + amountCents >= order.total ? "refunded" : "partially_refunded";
+      await client.query(
+        sql`UPDATE orders SET status = ${nextStatus} WHERE id = ${order.id}`
+      );
     });
-    await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
-    );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
-  });
+  } catch (e) {
+    if (e instanceof RefundExceedsRemainingError) {
+      return res.status(422).json({ error: "refund exceeds remaining refundable amount" });
+    }
+    throw e;
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
 
+// List the refunds recorded against one of the caller's orders, newest first,
+// along with how much of the order can still be refunded.
+//
+// Response shape:
+//   404 { error: string } when the order does not exist or is not the caller's.
+//   200 {
+//     orderId: string,
+//     refunds: { id: string; amount: number; status: "succeeded"; created_at: string }[],
+//     remainingRefundable: number, // cents
+//   }
+// A refund row is only written after the processor accepts the refund (see
+// POST /refunds), so every recorded refund has succeeded. `remainingRefundable`
+// follows the same rules POST /refunds enforces: zero for orders that cannot be
+// refunded (pending / cancelled), otherwise the total less all recorded refunds.
+payments.get("/orders/:id/refunds", async (req: AuthedRequest, res: Response) => {
+  // Scoped to the caller: another customer's order is indistinguishable from a
+  // nonexistent one (404, not 403).
+  const orderRows = await query<Order>(
+    sql`SELECT id, total, status FROM orders WHERE id = ${req.params.id} AND customer_id = ${req.userId}`
+  );
+  const order = orderRows[0];
+  if (!order) {
+    return res.status(404).json({ error: "order not found" });
+  }
+
+  const refundRows = await query<{
+    id: string;
+    amount: string | number;
+    created_at: string | Date;
+  }>(
+    sql`SELECT id, amount, created_at FROM refunds WHERE order_id = ${order.id} ORDER BY created_at DESC, id DESC`
+  );
+
+  const refunds = refundRows.map((row) => ({
+    id: row.id,
+    amount: Number(row.amount), // cents
+    status: "succeeded" as const,
+    created_at:
+      row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  }));
+
+  const refunded = refunds.reduce((sum, refund) => sum + refund.amount, 0);
+  const refundable = order.status !== "cancelled" && order.status !== "pending";
+  const remainingRefundable = refundable ? Math.max(0, order.total - refunded) : 0;
+
+  res.json({ orderId: order.id, refunds, remainingRefundable });
+});
+
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
+//
+// Response shape:
+//   400 { error: string } when `orderIds` is missing or an empty array.
+//   200 {
+//     ok: boolean,                                  // true only if `failed` is empty
+//     captured: string[],                           // order ids charged and marked paid, in request order
+//     failed: { orderId: string; error: string }[], // "order not found" | "payment declined" | "capture failed"
+//     skipped: { orderId: string; status: OrderStatus }[], // found but not pending; never charged
+//   }
+// Duplicate ids in the request are processed once. A 200 is returned even when
+// some or all captures fail; callers must inspect `ok` / `failed`.
 payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Response) => {
   const { orderIds } = req.body as { orderIds: string[] };
   if (!Array.isArray(orderIds) || orderIds.length === 0) {
@@ -103,21 +220,42 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
     sql`SELECT id, total, status FROM orders WHERE id = ANY(${orderIds}) AND customer_id = ${req.userId}`
   );
 
+  const byId = new Map(rows.map((order) => [order.id, order]));
   const captured: string[] = [];
-  await Promise.all(
-    rows.map(async (order) => {
+  const failed: { orderId: string; error: string }[] = [];
+  const skipped: { orderId: string; status: OrderStatus }[] = [];
+
+  // Capture sequentially, in request order: one processor call in flight at a
+  // time, and each order's outcome is recorded independently so one failure
+  // neither aborts nor hides the rest of the batch.
+  for (const orderId of new Set(orderIds)) {
+    const order = byId.get(orderId);
+    if (!order) {
+      failed.push({ orderId, error: "order not found" });
+      continue;
+    }
+    // Only orders still awaiting payment are charged; anything already paid,
+    // refunded or cancelled must never reach the processor again.
+    if (order.status !== "pending") {
+      skipped.push({ orderId, status: order.status });
+      continue;
+    }
+
+    try {
       await chargeProcessor({
-        amount: order.total,
+        amount: order.total, // cents
         apiKey: config.paymentApiKey,
         idempotencyKey: chargeIdempotencyKey(order.id),
       });
       await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
       captured.push(order.id);
-    })
-  ).catch(() => {
-    // One or more captures may have failed; the per-order status updates above
-    // record which ones actually settled.
-  });
+    } catch (e) {
+      failed.push({
+        orderId: order.id,
+        error: e instanceof ProcessorError ? "payment declined" : "capture failed",
+      });
+    }
+  }
 
-  res.json({ ok: true, captured });
+  res.json({ ok: failed.length === 0, captured, failed, skipped });
 });
