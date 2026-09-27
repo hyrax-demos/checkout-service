@@ -11,11 +11,26 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Wrap the real processor functions in spies so tests can assert on the
+// arguments sent across the processor boundary without changing behaviour.
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +50,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +142,83 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    // Routes the order lookup by SQL text (see the comment above) so these
+    // tests stay valid if extra lookups are added before the transaction.
+    function paidOrder(total: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total, status: "paid" }];
+        }
+        return [];
+      });
+    }
+
+    it("sends the refund amount to the processor in integer cents", async () => {
+      paidOrder(1999);
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ orderId: "order-1", amount: 1999 })
+      );
+    });
+
+    it("sends a partial refund to the processor in cents, matching the stored row", async () => {
+      paidOrder(1999);
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5.5 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(550);
+
+      const [args] = mockedRefundProcessor.mock.calls[0];
+      expect(args.amount).toBe(550);
+      expect(Number.isInteger(args.amount)).toBe(true);
+
+      // The processor, the refunds row and the response all agree on cents.
+      const insert = client.query.mock.calls
+        .map(([q]: [{ text: string; values: unknown[] }]) => q)
+        .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+      expect(insert.values).toContain(550);
+    });
+
+    it("rounds fractional-cent dollar inputs before calling the processor", async () => {
+      paidOrder(1000);
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 0.29 });
+      expect(res.status).toBe(200);
+      // 0.29 * 100 is 28.999999999999996 in floating point.
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(29);
+    });
+
+    it("does not call the processor when the refund exceeds the order total", async () => {
+      paidOrder(1999);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 20 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("does not call the processor for an invalid amount", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: "19.99" });
+      expect(res.status).toBe(400);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
     });
   });
 
