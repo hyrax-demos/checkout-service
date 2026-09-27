@@ -182,6 +182,25 @@ describe("POST /orders/:id/cancel", () => {
     expect(after.body.status).toBe("cancelled");
   });
 
+  it("includes the refund id and amount in the response for a paid order", async () => {
+    seedOrder({ status: "paid", total: 1999 });
+
+    const res = await cancel("order-1");
+
+    expect(res.status).toBe(200);
+    expect(db.refunds).toHaveLength(1);
+    expect(res.body.refund).toEqual({ id: db.refunds[0].id, amount: 1999 });
+  });
+
+  it("omits refund from the response for a pending order", async () => {
+    seedOrder({ status: "pending" });
+
+    const res = await cancel("order-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty("refund");
+  });
+
   it("returns 402 and leaves the order paid when the processor declines", async () => {
     seedOrder({ status: "paid" });
     mockedRefund.mockRejectedValueOnce(new ProcessorError("card_declined"));

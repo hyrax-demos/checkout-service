@@ -14,12 +14,22 @@ export interface CancelOrderArgs {
   customerId: string;
 }
 
+// The refund issued when a paid order is cancelled. `amount` is integer cents.
+export interface CancelRefund {
+  id: string;
+  amount: number;
+}
+
+// A cancelled order. `refund` is present only when a paid order was refunded.
+export type CancelledOrder = Order & { refund?: CancelRefund };
+
 // Cancel one of a customer's orders.
 //
 // - pending: flipped to 'cancelled'; no processor call, no refund row.
 // - paid: the full captured total is refunded through the processor first;
 //   only once that succeeds is the refund row recorded and the order flipped
-//   to 'cancelled'. A `ProcessorError` surfaces as `PaymentFailedError` with
+//   to 'cancelled'. The result carries `refund: { id, amount }` (cents).
+//   A `ProcessorError` surfaces as `PaymentFailedError` with
 //   nothing written.
 // - any other status: `OrderNotCancellableError`.
 // - missing, or owned by another customer: `NotFoundError` (indistinguishable).
@@ -31,7 +41,7 @@ export interface CancelOrderArgs {
 export async function cancelOrder({
   orderId,
   customerId,
-}: CancelOrderArgs): Promise<Order> {
+}: CancelOrderArgs): Promise<CancelledOrder> {
   return withTransaction(async (client) => {
     const rows = await client.query<Order>(
       sql`SELECT * FROM orders WHERE id = ${orderId} AND customer_id = ${customerId} FOR UPDATE`
@@ -75,12 +85,13 @@ export async function cancelOrder({
 
     // The processor has no refund reference in its current API, so the row
     // records our own id alongside the order and amount.
+    const refundId = newId();
     await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${newId()}, ${order.id}, ${amountCents})`
+      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
     const updated = await client.query<Order>(
       sql`UPDATE orders SET status = 'cancelled' WHERE id = ${order.id} RETURNING *`
     );
-    return updated[0];
+    return { ...updated[0], refund: { id: refundId, amount: amountCents } };
   });
 }

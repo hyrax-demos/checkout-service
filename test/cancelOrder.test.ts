@@ -167,6 +167,28 @@ describe("cancelOrder", () => {
     expect(orders.get("order-1")?.status).toBe("cancelled");
   });
 
+  it("returns the refund id and amount for a paid order", async () => {
+    seedOrder({ status: "paid", total: 1999 });
+
+    const result = await cancelOrder({
+      orderId: "order-1",
+      customerId: "cust-1",
+    });
+
+    expect(result.refund).toEqual({ id: refunds[0].id, amount: 1999 });
+  });
+
+  it("returns no refund for a cancelled pending order", async () => {
+    seedOrder({ status: "pending" });
+
+    const result = await cancelOrder({
+      orderId: "order-1",
+      customerId: "cust-1",
+    });
+
+    expect(result.refund).toBeUndefined();
+  });
+
   it("normalises a string-typed cents total (as pg may return) to an integer", async () => {
     seedOrder({ status: "paid", total: "1999" });
 
