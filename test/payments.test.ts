@@ -217,6 +217,123 @@ describe("payments routes", () => {
         expect(mockedWithTransaction).not.toHaveBeenCalled();
       });
     });
+
+    describe("cumulative refund guard", () => {
+      // An in-memory stand-in for the refunds table, shared by the fake
+      // transaction client so sequential requests see each other's rows.
+      // SUM is returned as a string, as `pg` does for numeric/bigint results.
+      function refundsStore(total: number, priorAmounts: number[]) {
+        const rows = priorAmounts.map((amount, i) => ({
+          id: `prior-${i}`,
+          order_id: "order-1",
+          amount,
+        }));
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+        const client = {
+          query: vi.fn(async (q: { text: string; values: unknown[] }) => {
+            if (q.text.includes("SUM(amount)") && q.text.includes("FROM refunds")) {
+              const sum = rows
+                .filter((r) => r.order_id === q.values[0])
+                .reduce((acc, r) => acc + r.amount, 0);
+              return [{ total: String(sum) }];
+            }
+            if (q.text.includes("INSERT INTO refunds")) {
+              const [id, order_id, amount] = q.values as [string, string, number];
+              rows.push({ id, order_id, amount });
+            }
+            return [];
+          }),
+        };
+        mockedWithTransaction.mockImplementation(async (fn: any) => fn(client));
+        return { rows, client };
+      }
+
+      function inserts(client: { query: ReturnType<typeof vi.fn> }) {
+        return client.query.mock.calls
+          .map(([q]: [{ text: string }]) => q)
+          .filter((q) => q.text.includes("INSERT INTO refunds"));
+      }
+
+      async function refundCents(cents: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: cents / 100 });
+      }
+
+      it("rejects a refund that would push the cumulative total past order.total", async () => {
+        const { rows, client } = refundsStore(1000, [600]);
+        const res = await refundCents(500);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(inserts(client)).toHaveLength(0);
+        expect(rows).toHaveLength(1);
+      });
+
+      it("allows a refund for exactly the remaining balance", async () => {
+        const { rows, client } = refundsStore(1000, [600]);
+        const res = await refundCents(400);
+        expect(res.status).toBe(200);
+        expect(res.body.refunded).toBe(true);
+        expect(res.body.amount).toBe(400);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(400);
+        expect(inserts(client)).toHaveLength(1);
+        expect(rows.map((r) => r.amount)).toEqual([600, 400]);
+      });
+
+      it("behaves as before for an order with no prior refunds", async () => {
+        const { rows } = refundsStore(1000, []);
+        const ok = await refundCents(1000);
+        expect(ok.status).toBe(200);
+        expect(ok.body.amount).toBe(1000);
+        expect(rows.map((r) => r.amount)).toEqual([1000]);
+      });
+
+      it("still rejects a single refund above order.total with no prior refunds", async () => {
+        const { client } = refundsStore(1000, []);
+        const res = await refundCents(1001);
+        expect(res.status).toBe(422);
+        expect(res.body).toEqual({ error: "refund exceeds order total" });
+        expect(mockedRefundProcessor).not.toHaveBeenCalled();
+        expect(inserts(client)).toHaveLength(0);
+      });
+
+      it("rejects the second of two sequential refunds once it crosses the total", async () => {
+        const { rows, client } = refundsStore(1000, []);
+
+        const first = await refundCents(700);
+        expect(first.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+
+        const second = await refundCents(301);
+        expect(second.status).toBe(422);
+        expect(second.body).toEqual({ error: "refund exceeds order total" });
+        // The processor was only called for the first refund.
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(inserts(client)).toHaveLength(1);
+        expect(rows.map((r) => r.amount)).toEqual([700]);
+      });
+
+      it("reads the prior total inside the same transaction as the insert", async () => {
+        const { client } = refundsStore(1000, [600]);
+        const res = await refundCents(400);
+        expect(res.status).toBe(200);
+        const texts = client.query.mock.calls.map(
+          ([q]: [{ text: string }]) => q.text
+        );
+        const sumIdx = texts.findIndex((t) => t.includes("SUM(amount)"));
+        const insertIdx = texts.findIndex((t) => t.includes("INSERT INTO refunds"));
+        expect(sumIdx).toBeGreaterThanOrEqual(0);
+        expect(sumIdx).toBeLessThan(insertIdx);
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {

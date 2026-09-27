@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
 import { query, sql, withTransaction } from "../db";
+import type { TransactionClient } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -76,7 +77,15 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
+  const accepted = await withTransaction(async (client) => {
+    // Refunds already issued against this order count toward its total, so
+    // a series of partial refunds can never add up to more than was captured.
+    // Read inside the transaction that records this refund.
+    const priorRefundedCents = await getRefundedTotalCents(client, order.id);
+    if (priorRefundedCents + amountCents > order.total) {
+      return false;
+    }
+
     await refundProcessor({
       orderId: order.id,
       amount: amountCents,
@@ -88,10 +97,34 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     await client.query(
       sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
     );
+    return true;
   });
+
+  if (!accepted) {
+    return res.status(422).json({ error: "refund exceeds order total" });
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
+
+// Sum of every refund already recorded against an order, in integer cents
+// (0 when there are none). Postgres returns SUM over an integer column as
+// numeric/bigint, which `pg` hands back as a string, so coerce explicitly and
+// refuse to proceed on anything that is not a finite number.
+async function getRefundedTotalCents(
+  client: Pick<TransactionClient, "query">,
+  orderId: string
+): Promise<number> {
+  const rows = await client.query<{ total: string | number | null }>(
+    sql`SELECT COALESCE(SUM(amount), 0) AS total FROM refunds WHERE order_id = ${orderId}`
+  );
+  const raw = rows[0]?.total ?? 0;
+  const total = Number(raw);
+  if (!Number.isFinite(total)) {
+    throw new Error(`invalid refunded total for order ${orderId}: ${String(raw)}`);
+  }
+  return total;
+}
 
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
