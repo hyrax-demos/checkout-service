@@ -35,6 +35,13 @@ The service listens on `:3000` by default.
 | POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
 | POST   | `/admin/credits`            | Issue a manual account credit        |
 
+## Coupons
+
+`POST /orders` accepts an optional `couponCode`. The coupon's `percent_off`
+is applied to `total` (integer cents, rounded half up); the order stores
+`coupon_code` and `discount`. Unknown, expired, or exhausted coupons are
+rejected with `422`. Schema: `db/migrations/001_coupons.sql`.
+
 ## Deployment
 
 Built with `npm run build`, deployed as a container behind the storefront ALB.

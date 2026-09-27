@@ -11,6 +11,8 @@ export interface Order {
   items: OrderItem[];
   status: OrderStatus;
   reference: string;
+  couponCode?: string | null; // coupon applied at creation, if any
+  discount?: number; // cents already subtracted from `total`
   createdAt: string;
 }
 
@@ -28,3 +30,11 @@ export interface Refund {
 }
 
 export type OrderStatus = "pending" | "paid" | "cancelled" | "refunded";
+
+export interface Coupon {
+  code: string;
+  percentOff: number; // 1-100
+  expiresAt: string | null;
+  maxUses: number | null;
+  uses: number;
+}
