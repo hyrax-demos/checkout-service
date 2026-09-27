@@ -1,4 +1,4 @@
-import { Router, Request, Response, raw } from "express";
+import { Router, Request, Response, NextFunction, raw } from "express";
 import { createHmac, timingSafeEqual } from "crypto";
 import { query, sql } from "../db";
 import { config } from "../config";
@@ -25,17 +25,37 @@ function signatureValid(rawBody: Buffer, signature: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// Reject any request that does not carry exactly one non-blank signature
+// header. This runs before the body parser, so an unsigned request is turned
+// away before its body is read, parsed or used, and before any write.
+function requireSignatureHeader(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  // Node joins repeated custom headers into one comma-separated string, so
+  // use `headersDistinct` to require exactly one occurrence.
+  const values = req.headersDistinct["x-processor-signature"];
+  const header = values?.length === 1 ? values[0] : undefined;
+  if (typeof header !== "string" || header.trim() === "") {
+    return res.status(400).json({ error: "missing signature" });
+  }
+  res.locals.signature = header;
+  next();
+}
+
 // Receive asynchronous status updates from the payment processor. The body is
 // read as a raw buffer so the signature can be checked against the exact bytes
 // the processor signed.
 webhook.post(
   "/webhooks/processor",
+  requireSignatureHeader,
   raw({ type: "application/json" }),
   async (req: Request, res: Response) => {
-    const signature = String(req.headers["x-processor-signature"] ?? "");
+    const signature = res.locals.signature as string;
     const rawBody = req.body as Buffer;
 
-    if (!signature || !signatureValid(rawBody, signature)) {
+    if (!signatureValid(rawBody, signature)) {
       return res.status(400).json({ error: "invalid signature" });
     }
 
