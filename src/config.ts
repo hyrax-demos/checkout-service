@@ -12,8 +12,27 @@ function required(name: string): string {
   return value;
 }
 
+// Platform-wide ceiling (in cents) on the size of a single refund issued
+// through POST /refunds. Finance can tune this per-environment; when unset
+// or empty it defaults to $500.00. This is a ceiling on top of the existing
+// per-order rule (a refund may never exceed the order's captured total) —
+// whichever limit is lower still applies.
+function refundMaxCents(): number {
+  const raw = process.env.REFUND_MAX_CENTS;
+  if (raw === undefined || raw === "") {
+    return 50000;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    throw new Error("REFUND_MAX_CENTS must be an integer number of cents");
+  }
+  return parsed;
+}
+
 export const config = {
   port: process.env.PORT ? Number(process.env.PORT) : 3000,
+
+  refundMaxCents: refundMaxCents(),
 
   database: {
     host: required("DB_HOST"),
