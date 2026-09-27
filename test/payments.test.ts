@@ -324,6 +324,60 @@ describe("payments routes", () => {
         expect(mockedRefundProcessor).not.toHaveBeenCalled();
         expect(insertCalls(db.clients)).toHaveLength(0);
       });
+
+      describe("order status", () => {
+        function statusUpdates(
+          clients: Array<{ query: ReturnType<typeof vi.fn> }>
+        ) {
+          const inTx = clients.flatMap((c) =>
+            c.query.mock.calls.map((call) => call[0] as Q)
+          );
+          const pooled = mockedQuery.mock.calls.map((call) => call[0] as Q);
+          return [...pooled, ...inTx].filter(
+            (q) => q.text.includes("UPDATE orders") && q.text.includes("status")
+          );
+        }
+
+        it("leaves the status unchanged after a partial refund", async () => {
+          const db = fakeDb({ id: "order-1", total: 1000 }, []);
+
+          const res = await refund(4);
+          expect(res.status).toBe(200);
+          expect(db.refunds).toEqual([{ order_id: "order-1", amount: 400 }]);
+          // No status write at all: the order stays 'paid'.
+          expect(statusUpdates(db.clients)).toHaveLength(0);
+        });
+
+        it("marks the order refunded when a single refund equals the total", async () => {
+          const db = fakeDb({ id: "order-1", total: 1000 }, []);
+
+          const res = await refund(10);
+          expect(res.status).toBe(200);
+          const updates = statusUpdates(db.clients);
+          expect(updates).toHaveLength(1);
+          expect(updates[0].text).toContain("'refunded'");
+          expect(updates[0].values).toContain("order-1");
+        });
+
+        it("marks the order refunded when a second partial refund reaches the total", async () => {
+          const db = fakeDb({ id: "order-1", total: 1000 }, []);
+
+          const first = await refund(4);
+          expect(first.status).toBe(200);
+          expect(statusUpdates(db.clients)).toHaveLength(0);
+
+          const second = await refund(6);
+          expect(second.status).toBe(200);
+          const updates = statusUpdates(db.clients);
+          expect(updates).toHaveLength(1);
+          expect(updates[0].text).toContain("'refunded'");
+          // The status write happens in the second request's transaction.
+          const secondTx = db.clients[1].query.mock.calls.map(
+            (call) => call[0] as Q
+          );
+          expect(secondTx).toContain(updates[0]);
+        });
+      });
     });
   });
 

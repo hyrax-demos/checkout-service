@@ -57,6 +57,8 @@ export interface RefundTotals {
   cumulativeRefundedCents: number;
   /** True when cumulativeRefundedCents would exceed the order's total. */
   exceedsTotal: boolean;
+  /** True when cumulativeRefundedCents reaches (or passes) the order's total. */
+  reachesTotal: boolean;
 }
 
 // Sum the refunds already issued against an order (integer cents; 0 if none).
@@ -86,6 +88,7 @@ export async function checkRefundTotals(
     priorRefundedCents,
     cumulativeRefundedCents,
     exceedsTotal: cumulativeRefundedCents > order.total,
+    reachesTotal: cumulativeRefundedCents >= order.total,
   };
 }
 
@@ -147,9 +150,14 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
       await client.query(
         sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
       );
-      await client.query(
-        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-      );
+      // Only a refund that brings the cumulative refunded total up to the
+      // captured total marks the order refunded; a partial refund leaves the
+      // order's status untouched.
+      if (totals.reachesTotal) {
+        await client.query(
+          sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+        );
+      }
     });
   } catch (e) {
     if (e instanceof RefundExceedsTotalError) {
