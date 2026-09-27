@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { testToken } from "./helpers/token";
 
@@ -13,6 +13,7 @@ vi.mock("../src/db", () => ({
 
 import { query, withTransaction } from "../src/db";
 import { buildApp } from "./helpers/app";
+import { parseRefundMaxCents } from "../src/config";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -126,6 +127,117 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+  });
+
+  describe("POST /refunds platform ceiling (REFUND_MAX_CENTS)", () => {
+    const originalCeiling = process.env.REFUND_MAX_CENTS;
+
+    afterEach(() => {
+      if (originalCeiling === undefined) {
+        delete process.env.REFUND_MAX_CENTS;
+      } else {
+        process.env.REFUND_MAX_CENTS = originalCeiling;
+      }
+    });
+
+    function orderWithTotal(total: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total, status: "paid" }];
+        }
+        return [];
+      });
+    }
+
+    function refund(amountDollars: number) {
+      return request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+    }
+
+    it("defaults to 50000 cents when unset", async () => {
+      delete process.env.REFUND_MAX_CENTS;
+      orderWithTotal(100000);
+      const res = await refund(500.01);
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("defaults to 50000 cents when empty", async () => {
+      process.env.REFUND_MAX_CENTS = "";
+      orderWithTotal(100000);
+      const res = await refund(500.01);
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("allows a refund exactly at the default ceiling", async () => {
+      delete process.env.REFUND_MAX_CENTS;
+      orderWithTotal(100000);
+      const client = fakeTransaction();
+      const res = await refund(500);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(50000);
+      expect(client.query).toHaveBeenCalled();
+    });
+
+    it("honours a configured ceiling", async () => {
+      process.env.REFUND_MAX_CENTS = "1000";
+      orderWithTotal(100000);
+      const over = await refund(10.01);
+      expect(over.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+
+      fakeTransaction();
+      const atCeiling = await refund(10);
+      expect(atCeiling.status).toBe(200);
+      expect(atCeiling.body.amount).toBe(1000);
+    });
+
+    it("still enforces the order total when it is below a high ceiling", async () => {
+      process.env.REFUND_MAX_CENTS = "100000000";
+      orderWithTotal(1999);
+      const res = await refund(20);
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("keeps existing validation ahead of the ceiling", async () => {
+      process.env.REFUND_MAX_CENTS = "1";
+      const bad = await refund(0);
+      expect(bad.status).toBe(400);
+
+      mockedQuery.mockResolvedValueOnce([]);
+      const missing = await refund(5);
+      expect(missing.status).toBe(404);
+
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 1999, status: "cancelled" },
+      ]);
+      const notRefundable = await refund(5);
+      expect(notRefundable.status).toBe(409);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("parseRefundMaxCents", () => {
+    it("falls back to the default for unset or blank values", () => {
+      expect(parseRefundMaxCents(undefined)).toBe(50000);
+      expect(parseRefundMaxCents("")).toBe(50000);
+      expect(parseRefundMaxCents("  ")).toBe(50000);
+    });
+
+    it("parses integer cents", () => {
+      expect(parseRefundMaxCents("0")).toBe(0);
+      expect(parseRefundMaxCents("123456")).toBe(123456);
+    });
+
+    it("rejects malformed values instead of disabling the ceiling", () => {
+      for (const bad of ["abc", "12.5", "-1", "1e5", "500 cents"]) {
+        expect(() => parseRefundMaxCents(bad)).toThrow(/REFUND_MAX_CENTS/);
+      }
     });
   });
 
