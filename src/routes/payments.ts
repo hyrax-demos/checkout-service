@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import { query, sql, withTransaction } from "../db";
-import { config } from "../config";
+import { config, refundMaxCents } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
 import { Order } from "../types";
@@ -71,6 +71,11 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
     return res.status(422).json({ error: "refund exceeds order total" });
+  }
+
+  // Platform-wide ceiling on any single refund, on top of the order total.
+  if (amountCents > refundMaxCents()) {
+    return res.status(422).json({ error: "refund exceeds maximum allowed amount" });
   }
 
   const refundId = newId();
