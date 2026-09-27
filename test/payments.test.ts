@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { testToken } from "./helpers/token";
 
@@ -126,6 +126,93 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("platform-wide refund ceiling (REFUND_MAX_CENTS)", () => {
+      function orderWithTotal(total: number) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      function refund(amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+      }
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it("defaults to 50000 cents when unset: rejects $500.01 with 422 and writes nothing", async () => {
+        const saved = process.env.REFUND_MAX_CENTS;
+        delete process.env.REFUND_MAX_CENTS;
+        try {
+          orderWithTotal(100000);
+          const res = await refund(500.01);
+          expect(res.status).toBe(422);
+          expect(mockedWithTransaction).not.toHaveBeenCalled();
+        } finally {
+          if (saved !== undefined) process.env.REFUND_MAX_CENTS = saved;
+        }
+      });
+
+      it("defaults to 50000 cents when empty: allows exactly $500.00", async () => {
+        vi.stubEnv("REFUND_MAX_CENTS", "");
+        orderWithTotal(100000);
+        fakeTransaction();
+        const res = await refund(500);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(50000);
+      });
+
+      it("honours a configured ceiling: exactly at the ceiling is allowed", async () => {
+        vi.stubEnv("REFUND_MAX_CENTS", "2500");
+        orderWithTotal(10000);
+        fakeTransaction();
+        const res = await refund(25);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(2500);
+      });
+
+      it("honours a configured ceiling: one cent over is rejected before the processor/transaction", async () => {
+        vi.stubEnv("REFUND_MAX_CENTS", "2500");
+        orderWithTotal(10000);
+        const res = await refund(25.01);
+        expect(res.status).toBe(422);
+        expect(mockedWithTransaction).not.toHaveBeenCalled();
+      });
+
+      it("keeps the order total binding when it is below a high ceiling", async () => {
+        vi.stubEnv("REFUND_MAX_CENTS", "100000000");
+        orderWithTotal(1999);
+        const res = await refund(20);
+        expect(res.status).toBe(422);
+        expect(res.body.error).toBe("refund exceeds order total");
+        expect(mockedWithTransaction).not.toHaveBeenCalled();
+      });
+
+      it("does not change the existing 400/404/409 validation", async () => {
+        vi.stubEnv("REFUND_MAX_CENTS", "1");
+
+        const bad = await refund(0);
+        expect(bad.status).toBe(400);
+
+        mockedQuery.mockResolvedValueOnce([]);
+        const missing = await refund(5);
+        expect(missing.status).toBe(404);
+
+        mockedQuery.mockResolvedValueOnce([
+          { id: "order-1", total: 1999, status: "cancelled" },
+        ]);
+        const notRefundable = await refund(5);
+        expect(notRefundable.status).toBe(409);
+      });
     });
   });
 
