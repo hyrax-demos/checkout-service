@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -126,6 +140,30 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("passes the refund amount to refundProcessor in integer cents", async () => {
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 5000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        // 4.35 * 100 is 434.99999999999994 in floating point; the processor
+        // must still receive exactly 435 cents.
+        .send({ reference: "ord_abc", amountDollars: 4.35 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      const args = mockedRefundProcessor.mock.calls[0][0];
+      expect(args.orderId).toBe("order-1");
+      expect(args.amount).toBe(435);
+      expect(Number.isInteger(args.amount)).toBe(true);
+      expect(args.amount).not.toBe(4.35);
     });
   });
 
