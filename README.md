@@ -35,6 +35,34 @@ The service listens on `:3000` by default.
 | POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
 | POST   | `/admin/credits`            | Issue a manual account credit        |
 
+## Processor webhooks
+
+`POST /webhooks/processor` accepts signed callbacks from the payment processor.
+The shared secret is read from the `WEBHOOK_SECRET` environment variable
+(required at boot).
+
+Required headers:
+
+- `x-webhook-signature`: lowercase hex HMAC-SHA256 of the exact raw request
+  body, keyed with `WEBHOOK_SECRET`. An optional `sha256=` prefix is accepted.
+- `x-webhook-timestamp`: unix epoch seconds. It must be within 5 minutes
+  (300s) of the server clock, in either direction.
+
+The checks run in this order:
+
+| Status | When                                                                 |
+| ------ | -------------------------------------------------------------------- |
+| 401    | Signature missing or invalid (checked before anything else)          |
+| 400    | Timestamp missing, non-numeric or outside the 5-minute window; malformed body or missing event `id` |
+| 200    | `{ "received": true, "duplicate": true }`: event `id` was already processed, so nothing is re-applied |
+| 409    | `charge.succeeded` for an order that is not `pending`; the order is left unchanged |
+| 200    | `{ "received": true }`: event handled and its `id` recorded          |
+
+An event id is recorded only after it is handled successfully, so a delivery
+that got a 409 or failed can be retried. Processed ids are held in memory right
+now (`src/processedEvents.ts`). They are lost on restart and not shared between
+instances.
+
 ## Deployment
 
 Built with `npm run build`, deployed as a container behind the storefront ALB.

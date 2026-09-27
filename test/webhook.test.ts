@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { computeSignature } from "../src/utils/webhookSignature";
 
@@ -80,6 +80,10 @@ describe("processor webhook", () => {
     await processedEvents.clear();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("accepts a correctly signed, fresh charge.succeeded event", async () => {
     const res = await sendEvent(app, chargeSucceeded);
     expect(res.status).toBe(200);
@@ -134,6 +138,25 @@ describe("processor webhook", () => {
     expect(mockedQuery).not.toHaveBeenCalled();
   });
 
+  it("rejects a signature of a different length with 401 (not 500)", async () => {
+    const short = await sendEvent(app, chargeSucceeded, { signature: "abcd" });
+    expect(short.status).toBe(401);
+    const long = await sendEvent(app, chargeSucceeded, { signature: "a".repeat(128) });
+    expect(long.status).toBe(401);
+    const notHex = await sendEvent(app, chargeSucceeded, { signature: "z".repeat(64) });
+    expect(notHex.status).toBe(401);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("rejects a body tampered with after signing with 401", async () => {
+    const signed = JSON.stringify(chargeSucceeded);
+    const tampered = JSON.stringify({ ...chargeSucceeded, data: { orderId: "order-2" } });
+    const res = await sendEvent(app, tampered, { signature: signPayload(signed) });
+    expect(res.status).toBe(401);
+    expect(mockedQuery).not.toHaveBeenCalled();
+    expect(orderStatus.get("order-1")).toBe("pending");
+  });
+
   it("rejects a body signed with a different secret with 401", async () => {
     const body = JSON.stringify(chargeSucceeded);
     const res = await sendEvent(app, body, { signature: signPayload(body, "other-secret") });
@@ -151,6 +174,26 @@ describe("processor webhook", () => {
 
   it("rejects a timestamp older than 5 minutes with 400", async () => {
     const res = await sendEvent(app, chargeSucceeded, { timestamp: nowSec() - 301 });
+    expect(res.status).toBe(400);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("uses the current clock for the 5-minute window (fake timers)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2024-01-01T00:00:00Z"));
+    const signedAt = nowSec();
+
+    vi.setSystemTime(new Date("2024-01-01T00:05:00Z"));
+    const atLimit = await sendEvent(app, chargeSucceeded, { timestamp: signedAt });
+    expect(atLimit.status).toBe(200);
+
+    vi.setSystemTime(new Date("2024-01-01T00:05:01Z"));
+    const stale = await sendEvent(app, { ...chargeSucceeded, id: "evt_3" }, { timestamp: signedAt });
+    expect(stale.status).toBe(400);
+  });
+
+  it("rejects a timestamp more than 5 minutes in the future with 400", async () => {
+    const res = await sendEvent(app, chargeSucceeded, { timestamp: nowSec() + 301 });
     expect(res.status).toBe(400);
     expect(mockedQuery).not.toHaveBeenCalled();
   });
