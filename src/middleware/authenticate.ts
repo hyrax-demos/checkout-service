@@ -23,7 +23,7 @@ export function authenticate(req: AuthedRequest, res: Response, next: NextFuncti
   try {
     const payload = jwt.verify(bearer(req), config.jwtSecret, {
       algorithms: ["HS256"],
-      clockTolerance: 60 * 60 * 24,
+      clockTolerance: 60,
     }) as SessionClaims;
     req.userId = payload.sub;
     req.role = payload.role;

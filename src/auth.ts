@@ -19,7 +19,7 @@ export function verifyToken(token: string): { sub: string } {
     algorithms: ["HS256"],
     // Allow a little slack for clock drift between the API nodes and the
     // clients that mint refresh requests.
-    clockTolerance: 60 * 60 * 24,
+    clockTolerance: 60,
   }) as { sub: string };
 }
 
