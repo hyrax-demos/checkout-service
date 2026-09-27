@@ -11,11 +11,24 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +48,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -127,6 +141,38 @@ describe("payments routes", () => {
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
     });
+
+    it.each([
+      [19.99, 1999],
+      [0.29, 29],
+      [5, 500],
+      [10.1, 1010],
+    ])(
+      "calls refundProcessor with integer cents for $%s",
+      async (dollars, cents) => {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          return [];
+        });
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: dollars });
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.amount).toBe(cents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+        expect(args.orderId).toBe("order-1");
+        const insert = client.query.mock.calls
+          .map((c: any[]) => c[0])
+          .find((q: { text: string }) => q.text.includes("INSERT INTO refunds"));
+        expect(insert.values).toContain(cents);
+      }
+    );
   });
 
   describe("POST /payments/capture-batch", () => {
