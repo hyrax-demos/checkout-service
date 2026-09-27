@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -126,6 +140,68 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("sends the refund amount to the processor in integer cents", async () => {
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 5000, status: "paid" }];
+        }
+        return [];
+      });
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 12.34 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      const args = mockedRefundProcessor.mock.calls[0][0];
+      expect(args.orderId).toBe("order-1");
+      expect(args.amount).toBe(1234);
+      expect(Number.isInteger(args.amount)).toBe(true);
+      // The processor, the persisted refund row and the response all agree.
+      const insert = client.query.mock.calls.find((c: any[]) =>
+        c[0].text.includes("INSERT INTO refunds")
+      );
+      expect(insert?.[0].values).toContain(1234);
+      expect(res.body.amount).toBe(1234);
+    });
+
+    it("rounds fractional-cent float input before calling the processor", async () => {
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      // 19.99 * 100 === 1998.9999999999998 in IEEE-754.
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(1999);
+    });
+
+    it("does not call the processor when the refund exceeds the order total", async () => {
+      mockedRefundProcessor.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1000, status: "paid" }];
+        }
+        return [];
+      });
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 10.01 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
     });
   });
 
