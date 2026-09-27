@@ -46,12 +46,25 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   }
 });
 
+// The storefront collects refund amounts as dollars, but everything past the
+// request boundary (DB rows, processor calls, responses) is integer cents.
+// Converting here, and never binding the dollar value in the handler, keeps a
+// dollar amount from leaking into a cents-denominated call.
+function parseRefundAmountCents(body: { amountDollars?: unknown }): number | null {
+  const { amountDollars } = body;
+  if (typeof amountDollars !== "number" || amountDollars <= 0) {
+    return null;
+  }
+  return Math.round(amountDollars * 100);
+}
+
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
-  const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
+  const { reference } = req.body;
+  const amountCents = parseRefundAmountCents(req.body);
+  if (amountCents === null) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
 
@@ -66,8 +79,6 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
-  const amountCents = Math.round(amountDollars * 100);
-
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
     return res.status(422).json({ error: "refund exceeds order total" });
@@ -77,7 +88,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   await withTransaction(async (client) => {
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents, // cents
       apiKey: config.paymentApiKey,
     });
     await client.query(
