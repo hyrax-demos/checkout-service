@@ -12,6 +12,26 @@ function required(name: string): string {
   return value;
 }
 
+// Default platform-wide ceiling on a single refund, in cents ($500.00).
+export const DEFAULT_REFUND_MAX_CENTS = 50000;
+
+// Parse the REFUND_MAX_CENTS value. Unset or empty falls back to the default;
+// anything that is not a non-negative integer number of cents is rejected at
+// boot so a typo cannot silently disable the ceiling.
+export function parseRefundMaxCents(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_REFUND_MAX_CENTS;
+  }
+  const trimmed = raw.trim();
+  const value = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(value)) {
+    throw new Error(
+      `invalid REFUND_MAX_CENTS: expected a non-negative integer number of cents, got "${raw}"`
+    );
+  }
+  return value;
+}
+
 export const config = {
   port: process.env.PORT ? Number(process.env.PORT) : 3000,
 
@@ -30,4 +50,8 @@ export const config = {
 
   // Shared secret used to verify processor webhook signatures.
   webhookSecret: required("WEBHOOK_SECRET"),
+
+  // Platform-wide maximum for a single refund via POST /refunds, in cents.
+  // Applies on top of the per-order captured-total limit.
+  refundMaxCents: parseRefundMaxCents(process.env.REFUND_MAX_CENTS),
 };
