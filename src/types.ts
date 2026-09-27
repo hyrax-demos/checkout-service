@@ -28,3 +28,26 @@ export interface Refund {
 }
 
 export type OrderStatus = "pending" | "paid" | "cancelled" | "refunded";
+
+// Money-moving actions recorded in the `audit_events` table.
+//
+// - `order.charged`: a single order was captured via /payments/charge.
+// - `refund.issued`: a refund was recorded via /refunds.
+// - `capture_batch.captured`: capture-batch claimed a pending order for capture.
+// - `capture_batch.released`: capture-batch released that claim because the
+//   processor did not settle the capture. This compensates for the earlier
+//   `capture_batch.captured` row, which is kept so the trail stays append-only.
+export type AuditAction =
+  | "order.charged"
+  | "refund.issued"
+  | "capture_batch.captured"
+  | "capture_batch.released";
+
+export interface AuditEvent {
+  id: string;
+  customerId: string;
+  action: AuditAction;
+  orderId: string;
+  amountCents: number;
+  createdAt: string;
+}

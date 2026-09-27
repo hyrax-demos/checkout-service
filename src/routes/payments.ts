@@ -42,7 +42,16 @@ payments.post("/payments/charge", chargeLimit, async (req: AuthedRequest, res: R
       apiKey: config.paymentApiKey,
       idempotencyKey: chargeIdempotencyKey(order.id),
     });
-    await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
+    // Flip the order to paid and record the audit event in one statement, so
+    // both commit together or neither does.
+    await query(
+      sql`WITH charged AS (
+            UPDATE orders SET status = 'paid' WHERE id = ${order.id}
+            RETURNING id, customer_id, total
+          )
+          INSERT INTO audit_events (id, customer_id, action, order_id, amount_cents)
+          SELECT ${newId()}::uuid, customer_id, 'order.charged', id, total FROM charged`
+    );
     res.json({ ok: true });
   } catch (e) {
     if (e instanceof ProcessorError) {
@@ -80,19 +89,30 @@ payments.post("/refunds", refundLimit, async (req: AuthedRequest, res: Response)
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountDollars,
-      apiKey: config.paymentApiKey,
+  try {
+    await withTransaction(async (client) => {
+      await refundProcessor({
+        orderId: order.id,
+        amount: amountDollars,
+        apiKey: config.paymentApiKey,
+      });
+      await client.query(
+        sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
+      );
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+      // The audit row is part of the same transaction. If it cannot be written,
+      // the refund row and the status change roll back with it.
+      await client.query(
+        sql`INSERT INTO audit_events (id, customer_id, action, order_id, amount_cents)
+            SELECT ${newId()}::uuid, customer_id, 'refund.issued', id, ${amountCents}::bigint
+            FROM orders WHERE id = ${order.id}`
+      );
     });
-    await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
-    );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
-  });
+  } catch {
+    return res.status(500).json({ error: "refund failed" });
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
@@ -124,10 +144,21 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
       // money moves. If a concurrent request (another batch, a single charge,
       // or a webhook) changed the status after the lookup above, no row comes
       // back and this order is skipped instead of being charged a second time.
+      //
+      // The claim and its audit event are written in one statement, so an
+      // order can never be claimed without an audit row, and a claim that
+      // loses the race records nothing.
       const claimed = await query<{ id: string }>(
-        sql`UPDATE orders SET status = 'paid'
-            WHERE id = ${order.id} AND customer_id = ${req.userId} AND status = 'pending'
-            RETURNING id`
+        sql`WITH claimed AS (
+              UPDATE orders SET status = 'paid'
+              WHERE id = ${order.id} AND customer_id = ${req.userId} AND status = 'pending'
+              RETURNING id, customer_id, total
+            ), audited AS (
+              INSERT INTO audit_events (id, customer_id, action, order_id, amount_cents)
+              SELECT ${newId()}::uuid, customer_id, 'capture_batch.captured', id, total
+              FROM claimed
+            )
+            SELECT id FROM claimed`
       );
       if (claimed.length === 0) {
         skipped.push(order.id);
@@ -144,9 +175,17 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
       } catch {
         // The capture did not settle: release the claim so the order can be
         // retried. The update only fires if nothing else has changed the
-        // status since this request claimed it.
+        // status since this request claimed it. A compensating audit event is
+        // recorded in the same statement. The earlier `captured` row is kept,
+        // so the trail stays append-only.
         await query(
-          sql`UPDATE orders SET status = 'pending' WHERE id = ${order.id} AND status = 'paid'`
+          sql`WITH released AS (
+                UPDATE orders SET status = 'pending' WHERE id = ${order.id} AND status = 'paid'
+                RETURNING id, customer_id, total
+              )
+              INSERT INTO audit_events (id, customer_id, action, order_id, amount_cents)
+              SELECT ${newId()}::uuid, customer_id, 'capture_batch.released', id, total
+              FROM released`
         ).catch(() => {
           // The order stays paid-but-uncharged. That is safer than charging
           // it twice, and reconciliation can clear it.
