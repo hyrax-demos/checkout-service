@@ -73,6 +73,12 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
+  // Independently of the order total, no single refund may exceed the
+  // platform-wide ceiling set by finance (REFUND_MAX_CENTS).
+  if (amountCents > config.refundMaxCents) {
+    return res.status(422).json({ error: "refund exceeds maximum allowed amount" });
+  }
+
   const refundId = newId();
   await withTransaction(async (client) => {
     await refundProcessor({

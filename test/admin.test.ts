@@ -58,4 +58,24 @@ describe("admin routes", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ credited: true });
   });
+
+  it("does not apply the refund ceiling to manual credits", async () => {
+    const original = process.env.REFUND_MAX_CENTS;
+    process.env.REFUND_MAX_CENTS = "100";
+    try {
+      mockedQuery.mockResolvedValueOnce([]);
+      const res = await request(app)
+        .post("/admin/credits")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ customerId: "user-1", amount: 100000 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ credited: true });
+    } finally {
+      if (original === undefined) {
+        delete process.env.REFUND_MAX_CENTS;
+      } else {
+        process.env.REFUND_MAX_CENTS = original;
+      }
+    }
+  });
 });
