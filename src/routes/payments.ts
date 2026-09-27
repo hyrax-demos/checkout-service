@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { query, sql, withTransaction } from "../db";
+import { query, sql, SqlQuery, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -46,6 +46,49 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
   }
 });
 
+type RowQuery = (q: SqlQuery) => Promise<Array<{ refunded?: unknown }>>;
+
+class RefundExceedsTotalError extends Error {}
+
+export interface RefundTotals {
+  /** Sum of all refunds already recorded for the order, integer cents. */
+  priorRefundedCents: number;
+  /** priorRefundedCents plus the refund being requested, integer cents. */
+  cumulativeRefundedCents: number;
+  /** True when cumulativeRefundedCents would exceed the order's total. */
+  exceedsTotal: boolean;
+}
+
+// Sum the refunds already issued against an order (integer cents; 0 if none).
+// `run` is either the pooled `query` or a transaction client's `query`.
+export async function sumRefundedCents(
+  run: RowQuery,
+  orderId: string
+): Promise<number> {
+  const rows = await run(
+    sql`SELECT COALESCE(SUM(amount), 0) AS refunded FROM refunds WHERE order_id = ${orderId}`
+  );
+  // pg returns SUM over an integer column as a bigint string.
+  return Number(rows[0]?.refunded ?? 0);
+}
+
+// Compute the prior/cumulative refunded totals for a prospective refund and
+// whether it would exceed the order's captured total. Refunding exactly up to
+// the total is allowed.
+export async function checkRefundTotals(
+  run: RowQuery,
+  order: Pick<Order, "id" | "total">,
+  amountCents: number
+): Promise<RefundTotals> {
+  const priorRefundedCents = await sumRefundedCents(run, order.id);
+  const cumulativeRefundedCents = priorRefundedCents + amountCents;
+  return {
+    priorRefundedCents,
+    cumulativeRefundedCents,
+    exceedsTotal: cumulativeRefundedCents > order.total,
+  };
+}
+
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
@@ -68,25 +111,52 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   const amountCents = Math.round(amountDollars * 100);
 
-  // A refund may not exceed the order's captured total.
-  if (amountCents > order.total) {
+  // A refund may not push the order's cumulative refunded amount past its
+  // captured total (`order.total`, integer cents). This also covers a single
+  // refund that alone exceeds the total (prior refunds = 0). This unlocked
+  // read is a fast path that rejects obvious over-refunds without opening a
+  // transaction; the authoritative check is repeated under a row lock below.
+  const precheck = await checkRefundTotals(query, order, amountCents);
+  if (precheck.exceedsTotal) {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
-    await refundProcessor({
-      orderId: order.id,
-      amount: amountCents, // cents, per RefundArgs contract
-      apiKey: config.paymentApiKey,
+  try {
+    await withTransaction(async (client) => {
+      // Lock the order row so concurrent refunds for the same order serialize
+      // here: the sum below, the processor call and the insert then run
+      // without another refund slipping in between (double-refund race).
+      await client.query(
+        sql`SELECT id FROM orders WHERE id = ${order.id} FOR UPDATE`
+      );
+      const totals = await checkRefundTotals(
+        (q) => client.query(q),
+        order,
+        amountCents
+      );
+      if (totals.exceedsTotal) {
+        throw new RefundExceedsTotalError();
+      }
+
+      await refundProcessor({
+        orderId: order.id,
+        amount: amountCents, // cents, per RefundArgs contract
+        apiKey: config.paymentApiKey,
+      });
+      await client.query(
+        sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
+      );
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
     });
-    await client.query(
-      sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
-    );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
-  });
+  } catch (e) {
+    if (e instanceof RefundExceedsTotalError) {
+      return res.status(422).json({ error: "refund exceeds order total" });
+    }
+    throw e;
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
