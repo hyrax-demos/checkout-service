@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -35,6 +49,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +141,46 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("passes the refund amount to the processor in integer cents", () => {
+      function refundableOrder(total: number) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      it.each([
+        [12.34, 1234],
+        [19.99, 1999],
+        [0.29, 29],
+        [0.07, 7],
+      ])("%s dollars -> %s cents", async (dollars, cents) => {
+        refundableOrder(10_000);
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: dollars });
+
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        const args = mockedRefundProcessor.mock.calls[0][0];
+        expect(args.orderId).toBe("order-1");
+        expect(args.amount).toBe(cents);
+        expect(Number.isInteger(args.amount)).toBe(true);
+
+        // The refunds row stores the same cents value.
+        const insert = client.query.mock.calls.find(([q]: [{ text: string }]) =>
+          q.text.includes("INSERT INTO refunds")
+        );
+        expect(insert).toBeDefined();
+        expect(insert![0].values).toContain(cents);
+        expect(insert![0].values).not.toContain(dollars);
+      });
     });
   });
 
