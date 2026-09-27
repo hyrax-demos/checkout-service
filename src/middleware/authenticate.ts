@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { config } from "../config";
+import { JWT_CLOCK_TOLERANCE_SECONDS } from "../auth";
 
 export interface AuthedRequest extends Request {
   userId?: string;
@@ -23,7 +24,8 @@ export function authenticate(req: AuthedRequest, res: Response, next: NextFuncti
   try {
     const payload = jwt.verify(bearer(req), config.jwtSecret, {
       algorithms: ["HS256"],
-      clockTolerance: 60 * 60 * 24,
+      // At most MAX_CLOCK_SKEW_SECONDS (60s) past `exp`; see src/auth.ts.
+      clockTolerance: JWT_CLOCK_TOLERANCE_SECONDS,
     }) as SessionClaims;
     req.userId = payload.sub;
     req.role = payload.role;
