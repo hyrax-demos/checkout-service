@@ -4,6 +4,11 @@ import { config } from "../config";
 import { checkTimestamp, verifySignature } from "../utils/webhookSignature";
 import { processedEvents } from "../processedEvents";
 import { markPaid } from "../orders";
+import {
+  webhookEventLog,
+  WebhookEventLogEntry,
+  WebhookOutcome,
+} from "../webhookEventLog";
 
 export const webhook = Router();
 
@@ -54,6 +59,107 @@ async function handleEvent(
   return undefined;
 }
 
+type DeliveryResult = {
+  status: number;
+  body: Record<string, unknown>;
+  outcome: WebhookOutcome;
+  reason: string | null;
+};
+
+// Pull log fields from a signature-verified body. Only string values are kept,
+// so a malformed payload cannot put arbitrary structures into the log.
+function logFields(event: unknown): Pick<WebhookEventLogEntry, "event_id" | "type" | "order_id"> {
+  const e = (event && typeof event === "object" ? event : {}) as Record<string, any>;
+  const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : null);
+  const data = e.data && typeof e.data === "object" ? e.data : {};
+  return { event_id: str(e.id), type: str(e.type), order_id: str(data.orderId) };
+}
+
+function tryParse(rawBody: Buffer): unknown {
+  try {
+    return JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+const reject = (status: number, error: string, reason: string): DeliveryResult => ({
+  status,
+  body: { error },
+  outcome: "rejected",
+  reason,
+});
+
+// Run the checks and side effects for one delivery and describe the result.
+// It never writes the response or the event log; the route handler owns both,
+// so every exit path is logged exactly once.
+// `signed` is the result of verifying the raw body's signature, and `parsed`
+// is that body parsed as JSON (undefined when unsigned or not valid JSON).
+async function processDelivery(
+  req: Request,
+  signed: boolean,
+  parsed: unknown
+): Promise<DeliveryResult> {
+  // (1) Signature: missing or invalid → 401.
+  if (!signed) {
+    return reject(401, "invalid signature", "invalid_signature");
+  }
+
+  // (2) Timestamp: missing, malformed or outside the window → 400.
+  const timestamp = checkTimestamp(headerValue(req, "x-webhook-timestamp"));
+  if (timestamp !== "ok") {
+    return reject(400, "invalid or stale timestamp", `${timestamp}_timestamp`);
+  }
+
+  // (3) Parse the event from the verified raw bytes.
+  if (parsed === undefined) {
+    return reject(400, "malformed JSON body", "malformed_json");
+  }
+  const event = parsed as ProcessorEvent;
+  if (!event || typeof event !== "object" || !event.data || typeof event.data !== "object") {
+    return reject(400, "malformed event", "malformed_event");
+  }
+  if (typeof event.id !== "string" || event.id.length === 0) {
+    return reject(400, "missing event id", "missing_event_id");
+  }
+
+  // (4) Replay: claim the id atomically before any side effect runs.
+  // Checking and reserving in one step means two concurrent deliveries of
+  // the same event cannot both get past this point.
+  const claim = await processedEvents.begin(event.id);
+  if (claim === "done") {
+    return {
+      status: 200,
+      body: { received: true, duplicate: true },
+      outcome: "duplicate",
+      reason: "already_processed",
+    };
+  }
+  if (claim === "in_progress") {
+    // A concurrent delivery owns this id. Answer non-2xx so the processor
+    // retries later: it then sees "done", or can claim the id itself if
+    // the other attempt failed.
+    return reject(409, "event is already being processed", "in_progress");
+  }
+
+  // (5) Handle the event. (6) Record the id as processed only if handling
+  // succeeded. On any other exit (409 or a thrown error) the claim is
+  // released so the processor can retry the delivery.
+  let handled = false;
+  try {
+    const rejection = await handleEvent(event);
+    if (rejection) {
+      return reject(rejection.status, rejection.error, "invalid_transition");
+    }
+    await processedEvents.complete(event.id);
+    handled = true;
+  } finally {
+    if (!handled) await processedEvents.release(event.id);
+  }
+
+  return { status: 200, body: { received: true }, outcome: "processed", reason: null };
+}
+
 // Receive asynchronous status updates from the payment processor. The body is
 // read as a raw buffer (whatever the content type) so the signature can be
 // checked against the exact bytes the processor signed. This router is mounted
@@ -63,62 +169,42 @@ webhook.post(
   "/webhooks/processor",
   raw({ type: "*/*" }),
   async (req: Request, res: Response) => {
+    const receivedAt = new Date().toISOString();
     const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
-    // (1) Signature: missing or invalid → 401.
-    const signature = headerValue(req, "x-webhook-signature");
-    if (!verifySignature(rawBody, signature, config.webhookSecret)) {
-      return res.status(401).json({ error: "invalid signature" });
-    }
+    // Event fields are logged only when the signature is valid, so an
+    // unauthenticated caller cannot plant arbitrary ids in the admin log.
+    const signed = verifySignature(
+      rawBody,
+      headerValue(req, "x-webhook-signature"),
+      config.webhookSecret
+    );
+    const parsed = signed ? tryParse(rawBody) : undefined;
+    const fields = signed
+      ? logFields(parsed)
+      : { event_id: null, type: null, order_id: null };
 
-    // (2) Timestamp: missing, malformed or outside the window → 400.
-    if (checkTimestamp(headerValue(req, "x-webhook-timestamp")) !== "ok") {
-      return res.status(400).json({ error: "invalid or stale timestamp" });
-    }
-
-    // (3) Parse the event from the verified raw bytes.
-    let event: ProcessorEvent;
+    let result: DeliveryResult;
     try {
-      event = JSON.parse(rawBody.toString("utf8")) as ProcessorEvent;
-    } catch {
-      return res.status(400).json({ error: "malformed JSON body" });
-    }
-    if (!event || typeof event !== "object" || !event.data || typeof event.data !== "object") {
-      return res.status(400).json({ error: "malformed event" });
-    }
-    if (typeof event.id !== "string" || event.id.length === 0) {
-      return res.status(400).json({ error: "missing event id" });
-    }
-
-    // (4) Replay: claim the id atomically before any side effect runs.
-    // Checking and reserving in one step means two concurrent deliveries of
-    // the same event cannot both get past this point.
-    const claim = await processedEvents.begin(event.id);
-    if (claim === "done") {
-      return res.json({ received: true, duplicate: true });
-    }
-    if (claim === "in_progress") {
-      // A concurrent delivery owns this id. Answer non-2xx so the processor
-      // retries later: it then sees "done", or can claim the id itself if
-      // the other attempt failed.
-      return res.status(409).json({ error: "event is already being processed" });
+      result = await processDelivery(req, signed, parsed);
+    } catch (err) {
+      await webhookEventLog.record({
+        ...fields,
+        outcome: "rejected",
+        reason: "handler_error",
+        status: 500,
+        received_at: receivedAt,
+      });
+      throw err;
     }
 
-    // (5) Handle the event. (6) Record the id as processed only if handling
-    // succeeded. On any other exit (409 or a thrown error) the claim is
-    // released so the processor can retry the delivery.
-    let handled = false;
-    try {
-      const rejection = await handleEvent(event);
-      if (rejection) {
-        return res.status(rejection.status).json({ error: rejection.error });
-      }
-      await processedEvents.complete(event.id);
-      handled = true;
-    } finally {
-      if (!handled) await processedEvents.release(event.id);
-    }
-
-    res.json({ received: true });
+    await webhookEventLog.record({
+      ...fields,
+      outcome: result.outcome,
+      reason: result.reason,
+      status: result.status,
+      received_at: receivedAt,
+    });
+    res.status(result.status).json(result.body);
   }
 );

@@ -34,6 +34,7 @@ The service listens on `:3000` by default.
 | POST   | `/webhooks/processor`       | Processor status callbacks (signed)  |
 | POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
 | POST   | `/admin/credits`            | Issue a manual account credit        |
+| GET    | `/admin/webhook-events`     | Webhook delivery log (admin)         |
 
 ## Processor webhooks
 
@@ -62,6 +63,19 @@ An event id is recorded only after it is handled successfully, so a delivery
 that got a 409 or failed can be retried. Processed ids are held in memory right
 now (`src/processedEvents.ts`). They are lost on restart and not shared between
 instances.
+
+### Webhook event log
+
+`GET /admin/webhook-events` (admin role required) lists webhook deliveries,
+newest first. Every delivery is recorded, rejected attempts included. Each
+entry has `event_id`, `type`, `order_id`, `outcome` (`processed`, `duplicate`
+or `rejected`), `reason`, `status` (the HTTP status returned) and `received_at`
+(ISO-8601). Event fields are only logged for correctly signed requests, so
+they are `null` for a delivery with a bad signature.
+
+Query parameters: `limit` (1 to 200, default 50) and `offset` (default 0). The
+response is `{ events, total, limit, offset }`. The log is held in memory
+(`src/webhookEventLog.ts`) and keeps the most recent 1000 entries.
 
 ## Deployment
 
