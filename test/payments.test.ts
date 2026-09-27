@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { testToken } from "./helpers/token";
 
@@ -126,6 +126,102 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("platform refund ceiling (REFUND_MAX_CENTS)", () => {
+      const original = process.env.REFUND_MAX_CENTS;
+
+      afterEach(() => {
+        if (original === undefined) {
+          delete process.env.REFUND_MAX_CENTS;
+        } else {
+          process.env.REFUND_MAX_CENTS = original;
+        }
+      });
+
+      function paidOrder(total: number) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      function refund(amountDollars: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars });
+      }
+
+      it("defaults to $500.00 when unset: rejects $500.01 with 422 and writes nothing", async () => {
+        delete process.env.REFUND_MAX_CENTS;
+        paidOrder(100000);
+        const res = await refund(500.01);
+        expect(res.status).toBe(422);
+        expect(mockedWithTransaction).not.toHaveBeenCalled();
+        expect(mockedQuery).toHaveBeenCalledTimes(1);
+      });
+
+      it("defaults to $500.00 when empty: allows exactly $500.00", async () => {
+        process.env.REFUND_MAX_CENTS = "";
+        paidOrder(100000);
+        fakeTransaction();
+        const res = await refund(500);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(50000);
+      });
+
+      it("honours a configured ceiling and allows a refund exactly at it", async () => {
+        process.env.REFUND_MAX_CENTS = "2500";
+        paidOrder(100000);
+        fakeTransaction();
+        const res = await refund(25);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(2500);
+      });
+
+      it("rejects one cent over a configured ceiling before calling the processor", async () => {
+        process.env.REFUND_MAX_CENTS = "2500";
+        paidOrder(100000);
+        const client = fakeTransaction();
+        const res = await refund(25.01);
+        expect(res.status).toBe(422);
+        expect(mockedWithTransaction).not.toHaveBeenCalled();
+        expect(client.query).not.toHaveBeenCalled();
+      });
+
+      it("allows refunds above the default when the ceiling is raised", async () => {
+        process.env.REFUND_MAX_CENTS = "200000";
+        paidOrder(150000);
+        fakeTransaction();
+        const res = await refund(1500);
+        expect(res.status).toBe(200);
+        expect(res.body.amount).toBe(150000);
+      });
+
+      it("still enforces the order total when it is below a high ceiling", async () => {
+        process.env.REFUND_MAX_CENTS = "99999999";
+        paidOrder(1999);
+        const res = await refund(20);
+        expect(res.status).toBe(422);
+        expect(mockedWithTransaction).not.toHaveBeenCalled();
+      });
+
+      it("keeps 400/404/409 behaviour ahead of the ceiling", async () => {
+        process.env.REFUND_MAX_CENTS = "100";
+
+        expect((await refund(0)).status).toBe(400);
+
+        mockedQuery.mockResolvedValueOnce([]);
+        expect((await refund(5000)).status).toBe(404);
+
+        mockedQuery.mockResolvedValueOnce([
+          { id: "order-1", total: 1999, status: "cancelled" },
+        ]);
+        expect((await refund(5000)).status).toBe(409);
+      });
     });
   });
 
