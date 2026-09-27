@@ -12,6 +12,28 @@ function required(name: string): string {
   return value;
 }
 
+export const DEFAULT_REFUND_MAX_CENTS = 50000;
+
+// Platform-wide ceiling (in cents) on any single refund issued through
+// POST /refunds. Read on each call so the value tracks the environment.
+// An invalid value fails closed (throws) rather than silently loosening
+// or changing the ceiling.
+export function refundMaxCents(): number {
+  const raw = process.env.REFUND_MAX_CENTS;
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_REFUND_MAX_CENTS;
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error("REFUND_MAX_CENTS must be a non-negative integer");
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error("REFUND_MAX_CENTS must be a non-negative integer");
+  }
+  return value;
+}
+
 export const config = {
   port: process.env.PORT ? Number(process.env.PORT) : 3000,
 
