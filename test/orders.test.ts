@@ -125,6 +125,35 @@ describe("orders routes", () => {
       expect(mockedQuery).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ["items is missing", { total: 500 }],
+      ["items is empty", { total: 500, items: [] }],
+      ["items is not an array", { total: 500, items: { sku: "sku-1" } }],
+    ])("keeps the items error message when %s", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "items must be a non-empty array" });
+    });
+
+    it.each([
+      ["total is missing", { items: validItems }],
+      ["total is zero", { total: 0, items: validItems }],
+      ["total is fractional", { total: 10.5, items: validItems }],
+      ["total is a numeric string", { total: "500", items: validItems }],
+    ])("keeps the total error message when %s", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({
+        error: "total must be a positive integer number of cents",
+      });
+    });
+
     it("accepts the smallest positive total", async () => {
       mockedQuery.mockResolvedValueOnce([
         { id: "order-min", total: 1, items: validItems, status: "pending" },

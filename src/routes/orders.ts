@@ -3,6 +3,7 @@ import { query, sql } from "../db";
 import { AuthedRequest } from "../middleware/authenticate";
 import { generateOrderReference } from "../utils/tokens";
 import { Order } from "../types";
+import { isNonEmptyArray, isPositiveIntegerCents } from "../validation";
 
 export const orders = Router();
 
@@ -30,10 +31,10 @@ orders.get("/orders", async (req: AuthedRequest, res: Response) => {
 // Create a new order for the authenticated customer.
 orders.post("/orders", async (req: AuthedRequest, res: Response) => {
   const { total, items } = req.body ?? {};
-  if (!Array.isArray(items) || items.length === 0) {
+  if (!isNonEmptyArray(items)) {
     return res.status(400).json({ error: "items must be a non-empty array" });
   }
-  if (!Number.isSafeInteger(total) || total <= 0) {
+  if (!isPositiveIntegerCents(total)) {
     return res
       .status(400)
       .json({ error: "total must be a positive integer number of cents" });

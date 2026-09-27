@@ -94,6 +94,21 @@ describe("payments routes", () => {
       expect(res.status).toBe(400);
     });
 
+    it.each([
+      ["zero", 0],
+      ["negative", -5],
+      ["a numeric string", "5"],
+      ["missing", undefined],
+    ])("keeps the amount error message when amountDollars is %s", async (_label, amountDollars) => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "amountDollars must be a positive number" });
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
     it("returns 404 when no order has that reference", async () => {
       mockedQuery.mockResolvedValueOnce([]);
       const res = await request(app)
@@ -146,6 +161,21 @@ describe("payments routes", () => {
         .set("Authorization", `Bearer ${token}`)
         .send({ orderIds: [] });
       expect(res.status).toBe(400);
+    });
+
+    it.each([
+      ["empty", []],
+      ["missing", undefined],
+      ["not an array", "order-1"],
+      ["an array with a non-string id", ["order-1", 42]],
+    ])("keeps the orderIds error message when orderIds is %s", async (_label, orderIds) => {
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "orderIds must be a non-empty array" });
+      expect(mockedQuery).not.toHaveBeenCalled();
     });
 
     it("captures every matching order", async () => {

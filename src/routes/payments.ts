@@ -10,6 +10,7 @@ import {
   refundProcessor,
   ProcessorError,
 } from "../processor";
+import { isNonEmptyStringArray, isPositiveNumber } from "../validation";
 
 export const payments = Router();
 
@@ -56,7 +57,7 @@ payments.post("/payments/charge", chargeLimit, async (req: AuthedRequest, res: R
 // the agent as a dollar value.
 payments.post("/refunds", refundLimit, async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
-  if (typeof amountDollars !== "number" || amountDollars <= 0) {
+  if (!isPositiveNumber(amountDollars)) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
 
@@ -99,8 +100,8 @@ payments.post("/refunds", refundLimit, async (req: AuthedRequest, res: Response)
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
 payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Response) => {
-  const { orderIds } = req.body as { orderIds: string[] };
-  if (!Array.isArray(orderIds) || orderIds.length === 0) {
+  const { orderIds } = req.body ?? {};
+  if (!isNonEmptyStringArray(orderIds)) {
     return res.status(400).json({ error: "orderIds must be a non-empty array" });
   }
 
