@@ -56,9 +56,27 @@ const chargeSucceeded = {
 describe("processor webhook", () => {
   const app = buildApp();
 
+  // Minimal stand-in for the orders table so tests can assert on status.
+  let orderStatus: Map<string, string>;
+
   beforeEach(async () => {
+    orderStatus = new Map([["order-1", "pending"]]);
     mockedQuery.mockReset();
-    mockedQuery.mockResolvedValue([]);
+    mockedQuery.mockImplementation(async (q: { text: string; values: unknown[] }) => {
+      const id = q.values[0] as string;
+      if (q.text.startsWith("UPDATE orders SET status = 'paid'")) {
+        if (q.text.includes("status = 'pending'") && orderStatus.get(id) !== "pending") {
+          return [];
+        }
+        if (!orderStatus.has(id)) return [];
+        orderStatus.set(id, "paid");
+        return [{ id }];
+      }
+      if (q.text.startsWith("SELECT status FROM orders")) {
+        return orderStatus.has(id) ? [{ status: orderStatus.get(id) }] : [];
+      }
+      return [];
+    });
     await processedEvents.clear();
   });
 
@@ -70,6 +88,31 @@ describe("processor webhook", () => {
     const [statement] = mockedQuery.mock.calls[0];
     expect(statement.text).toContain("status = 'paid'");
     expect(statement.values).toEqual(["order-1"]);
+    expect(orderStatus.get("order-1")).toBe("paid");
+  });
+
+  it("rejects paying an order that is not pending with 409 and leaves it unchanged", async () => {
+    orderStatus.set("order-1", "cancelled");
+    const res = await sendEvent(app, chargeSucceeded);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "order is not awaiting payment" });
+    expect(orderStatus.get("order-1")).toBe("cancelled");
+    // The event is not recorded as processed.
+    expect(await processedEvents.has(chargeSucceeded.id)).toBe(false);
+  });
+
+  it("rejects a second payment for an already paid order with 409", async () => {
+    orderStatus.set("order-1", "paid");
+    const res = await sendEvent(app, { ...chargeSucceeded, id: "evt_2" });
+    expect(res.status).toBe(409);
+    expect(orderStatus.get("order-1")).toBe("paid");
+    expect(await processedEvents.has("evt_2")).toBe(false);
+  });
+
+  it("acknowledges a payment event for an unknown order without changes", async () => {
+    const res = await sendEvent(app, { ...chargeSucceeded, data: { orderId: "missing" } });
+    expect(res.status).toBe(200);
+    expect(orderStatus.has("missing")).toBe(false);
   });
 
   it("accepts a sha256= prefixed signature", async () => {

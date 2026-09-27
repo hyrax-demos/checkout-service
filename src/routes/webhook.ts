@@ -3,6 +3,7 @@ import { query, sql } from "../db";
 import { config } from "../config";
 import { checkTimestamp, verifySignature } from "../utils/webhookSignature";
 import { processedEvents } from "../processedEvents";
+import { markPaid } from "../orders";
 
 export const webhook = Router();
 
@@ -65,11 +66,16 @@ webhook.post(
 
     // (5) Handle the event.
     switch (event.type) {
-      case "charge.succeeded":
-        await query(
-          sql`UPDATE orders SET status = 'paid' WHERE id = ${event.data.orderId}`
-        );
+      case "charge.succeeded": {
+        // Only a 'pending' order may become 'paid'. An invalid transition
+        // leaves the order untouched and is not recorded as processed. An
+        // unknown order keeps the prior behaviour (acknowledged, no-op).
+        const result = await markPaid(event.data.orderId as string);
+        if (!result.ok && result.reason === "invalid_transition") {
+          return res.status(409).json({ error: "order is not awaiting payment" });
+        }
         break;
+      }
       case "charge.refunded":
         await query(
           sql`UPDATE orders SET status = 'refunded' WHERE id = ${event.data.orderId}`
