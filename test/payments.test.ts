@@ -29,6 +29,15 @@ function fakeTransaction() {
   return client;
 }
 
+// After the initial order lookup, answer the capture-batch claim
+// (`UPDATE ... status = 'pending' RETURNING id`) as won by returning the
+// claimed row, and every other statement with no rows.
+function claimSucceeds() {
+  mockedQuery.mockImplementation(async (q: { text: string; values: unknown[] }) =>
+    q.text.includes("RETURNING id") ? [{ id: q.values[0] }] : []
+  );
+}
+
 describe("payments routes", () => {
   const app = buildApp();
   const token = testToken("user-1");
@@ -144,7 +153,7 @@ describe("payments routes", () => {
         { id: "order-1", total: 500, status: "pending" },
         { id: "order-2", total: 700, status: "pending" },
       ]);
-      mockedQuery.mockResolvedValue([]);
+      claimSucceeds();
       const res = await request(app)
         .post("/payments/capture-batch")
         .set("Authorization", `Bearer ${token}`)
@@ -162,7 +171,7 @@ describe("payments routes", () => {
         { id: "order-3", total: 900, status: "cancelled" },
         { id: "order-4", total: 1100, status: "refunded" },
       ]);
-      mockedQuery.mockResolvedValue([]);
+      claimSucceeds();
       const chargeSpy = vi.spyOn(processor, "chargeProcessor");
       const res = await request(app)
         .post("/payments/capture-batch")
@@ -182,7 +191,7 @@ describe("payments routes", () => {
       mockedQuery.mockResolvedValueOnce([
         { id: "order-1", total: 500, status: "pending" },
       ]);
-      mockedQuery.mockResolvedValue([]);
+      claimSucceeds();
       const res = await request(app)
         .post("/payments/capture-batch")
         .set("Authorization", `Bearer ${token}`)
@@ -206,6 +215,49 @@ describe("payments routes", () => {
       expect(res.body.skipped).toEqual(["order-2"]);
       expect(chargeSpy).not.toHaveBeenCalled();
       expect(mockedQuery).toHaveBeenCalledTimes(1);
+      chargeSpy.mockRestore();
+    });
+
+    it("does not charge an order another request moved out of pending first", async () => {
+      // The lookup still sees `pending`, but by the time the claim runs a
+      // concurrent capture has already flipped the order, so the guarded
+      // update matches no rows.
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+      ]);
+      mockedQuery.mockResolvedValue([]);
+      const chargeSpy = vi.spyOn(processor, "chargeProcessor");
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual([]);
+      expect(res.body.skipped).toEqual(["order-1"]);
+      expect(chargeSpy).not.toHaveBeenCalled();
+      const claim = mockedQuery.mock.calls[1][0] as { text: string };
+      expect(claim.text).toContain("status = 'pending'");
+      chargeSpy.mockRestore();
+    });
+
+    it("releases the claim when the processor rejects the capture", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 500, status: "pending" },
+      ]);
+      claimSucceeds();
+      const chargeSpy = vi
+        .spyOn(processor, "chargeProcessor")
+        .mockRejectedValueOnce(new processor.ProcessorError("declined"));
+      const res = await request(app)
+        .post("/payments/capture-batch")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ orderIds: ["order-1"] });
+      expect(res.status).toBe(200);
+      expect(res.body.captured).toEqual([]);
+      // Lookup, claim, then the revert back to pending.
+      expect(mockedQuery).toHaveBeenCalledTimes(3);
+      const revert = mockedQuery.mock.calls[2][0] as { text: string };
+      expect(revert.text).toContain("SET status = 'pending'");
       chargeSpy.mockRestore();
     });
   });

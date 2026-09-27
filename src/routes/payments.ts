@@ -105,26 +105,49 @@ payments.post("/payments/capture-batch", async (req: AuthedRequest, res: Respons
 
   // Only orders still awaiting payment may be captured. Anything else that was
   // requested (already paid, cancelled, refunded, or not found for this
-  // caller) is reported back as skipped rather than charged.
-  const pending = rows.filter((order) => order.status === "pending");
-  const pendingIds = new Set(pending.map((order) => order.id));
-  const skipped = [...new Set(orderIds)].filter((id) => !pendingIds.has(id));
+  // caller) is reported back as skipped rather than charged. The status read
+  // above is only a pre-filter; the claim below is what actually decides.
+  const candidates = rows.filter((order) => order.status === "pending");
+  const candidateIds = new Set(candidates.map((order) => order.id));
+  const skipped = [...new Set(orderIds)].filter((id) => !candidateIds.has(id));
 
   const captured: string[] = [];
   await Promise.all(
-    pending.map(async (order) => {
-      await chargeProcessor({
-        amount: order.total,
-        apiKey: config.paymentApiKey,
-        idempotencyKey: chargeIdempotencyKey(order.id),
-      });
-      await query(sql`UPDATE orders SET status = 'paid' WHERE id = ${order.id}`);
-      captured.push(order.id);
+    candidates.map(async (order) => {
+      // Atomically claim the order by moving it out of `pending` before any
+      // money moves. If a concurrent request (another batch, a single charge,
+      // or a webhook) changed the status after the lookup above, no row comes
+      // back and this order is skipped instead of being charged a second time.
+      const claimed = await query<{ id: string }>(
+        sql`UPDATE orders SET status = 'paid'
+            WHERE id = ${order.id} AND customer_id = ${req.userId} AND status = 'pending'
+            RETURNING id`
+      );
+      if (claimed.length === 0) {
+        skipped.push(order.id);
+        return;
+      }
+
+      try {
+        await chargeProcessor({
+          amount: order.total,
+          apiKey: config.paymentApiKey,
+          idempotencyKey: chargeIdempotencyKey(order.id),
+        });
+        captured.push(order.id);
+      } catch {
+        // The capture did not settle: release the claim so the order can be
+        // retried. The update only fires if nothing else has changed the
+        // status since this request claimed it.
+        await query(
+          sql`UPDATE orders SET status = 'pending' WHERE id = ${order.id} AND status = 'paid'`
+        ).catch(() => {
+          // The order stays paid-but-uncharged. That is safer than charging
+          // it twice, and reconciliation can clear it.
+        });
+      }
     })
-  ).catch(() => {
-    // One or more captures may have failed; the per-order status updates above
-    // record which ones actually settled.
-  });
+  );
 
   res.json({ ok: true, captured, skipped });
 });
