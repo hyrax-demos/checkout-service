@@ -30,4 +30,24 @@ export const config = {
 
   // Shared secret used to verify processor webhook signatures.
   webhookSecret: required("WEBHOOK_SECRET"),
+
+  // Per-customer limit on money-moving endpoints (POST /payments/charge and
+  // POST /refunds): at most `maxRequests` per customer within any sliding
+  // window of `windowMs` milliseconds. Each endpoint has its own budget.
+  rateLimit: {
+    maxRequests: positiveInt("RATE_LIMIT_MAX_REQUESTS", 10),
+    windowMs: positiveInt("RATE_LIMIT_WINDOW_MS", 60_000),
+  },
 };
+
+function positiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer, got: ${raw}`);
+  }
+  return value;
+}

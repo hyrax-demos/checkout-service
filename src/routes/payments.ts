@@ -2,6 +2,7 @@ import { Router, Response } from "express";
 import { query, sql, withTransaction } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
+import { rateLimit } from "../middleware/rateLimit";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
 import { Order } from "../types";
 import {
@@ -12,8 +13,12 @@ import {
 
 export const payments = Router();
 
+// Each money-moving endpoint gets its own per-customer budget.
+const chargeLimit = rateLimit(config.rateLimit);
+const refundLimit = rateLimit(config.rateLimit);
+
 // Capture payment for an order against the upstream processor.
-payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
+payments.post("/payments/charge", chargeLimit, async (req: AuthedRequest, res: Response) => {
   const { orderId, card } = req.body;
 
   const rows = await query<Order>(
@@ -49,7 +54,7 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
-payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
+payments.post("/refunds", refundLimit, async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
