@@ -15,14 +15,38 @@ interface ProcessorEvent {
   };
 }
 
-// Verify the processor's HMAC signature over the raw request body.
-function signatureValid(rawBody: Buffer, signature: string): boolean {
+const HEX_RE = /^[0-9a-fA-F]+$/;
+
+// Verify the processor's HMAC signature over the raw request body, in constant
+// time. Returns false (never throws) for any malformed signature.
+export function signatureValid(rawBody: Buffer, signature: string): boolean {
+  // A non-JSON content type leaves `raw()` without a Buffer body; treat that
+  // as unverifiable rather than letting `update()` throw.
+  if (!Buffer.isBuffer(rawBody)) {
+    return false;
+  }
   const expected = createHmac("sha256", config.webhookSecret)
     .update(rawBody)
     .digest("hex");
-  const a = Buffer.from(signature, "hex");
-  const b = Buffer.from(expected, "hex");
-  return a.length === b.length && timingSafeEqual(a, b);
+  // `Buffer.from(x, "hex")` silently drops invalid characters and a trailing
+  // odd nibble, so validate the string itself before decoding. The length
+  // check also guarantees equal-length buffers for `timingSafeEqual`, which
+  // throws otherwise.
+  if (
+    typeof signature !== "string" ||
+    signature.length !== expected.length ||
+    !HEX_RE.test(signature)
+  ) {
+    return false;
+  }
+  try {
+    return timingSafeEqual(
+      Buffer.from(expected, "hex"),
+      Buffer.from(signature, "hex")
+    );
+  } catch {
+    return false;
+  }
 }
 
 // Reject any request that does not carry exactly one non-blank signature
