@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import { testToken } from "./helpers/token";
 
@@ -11,10 +11,23 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
   typeof vi.fn
 >;
@@ -126,6 +139,116 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+  });
+
+  describe("POST /refunds platform-wide ceiling (REFUND_MAX_CENTS)", () => {
+    const originalMax = process.env.REFUND_MAX_CENTS;
+
+    function paidOrder(total: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total, status: "paid" }];
+        }
+        return [];
+      });
+    }
+
+    function refund(amountDollars: number) {
+      return request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars });
+    }
+
+    function expectNothingProcessedOrWritten() {
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    }
+
+    beforeEach(() => {
+      mockedRefundProcessor.mockClear();
+      delete process.env.REFUND_MAX_CENTS;
+    });
+
+    afterEach(() => {
+      if (originalMax === undefined) {
+        delete process.env.REFUND_MAX_CENTS;
+      } else {
+        process.env.REFUND_MAX_CENTS = originalMax;
+      }
+    });
+
+    it("defaults to 50000 cents when REFUND_MAX_CENTS is unset", async () => {
+      paidOrder(100000);
+      const res = await refund(500.01);
+      expect(res.status).toBe(422);
+      expectNothingProcessedOrWritten();
+    });
+
+    it("defaults to 50000 cents when REFUND_MAX_CENTS is empty", async () => {
+      process.env.REFUND_MAX_CENTS = "";
+      paidOrder(100000);
+      const res = await refund(500.01);
+      expect(res.status).toBe(422);
+      expectNothingProcessedOrWritten();
+    });
+
+    it("allows a refund exactly at the default ceiling", async () => {
+      paidOrder(100000);
+      fakeTransaction();
+      const res = await refund(500);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(50000);
+    });
+
+    it("honours a configured REFUND_MAX_CENTS", async () => {
+      process.env.REFUND_MAX_CENTS = "10000";
+      paidOrder(100000);
+      const over = await refund(100.01);
+      expect(over.status).toBe(422);
+      expectNothingProcessedOrWritten();
+
+      fakeTransaction();
+      const atLimit = await refund(100);
+      expect(atLimit.status).toBe(200);
+      expect(atLimit.body.amount).toBe(10000);
+    });
+
+    it("allows refunds above the default when the ceiling is raised", async () => {
+      process.env.REFUND_MAX_CENTS = "200000";
+      paidOrder(150000);
+      fakeTransaction();
+      const res = await refund(1500);
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(150000);
+    });
+
+    it("still enforces the order total when it is below the ceiling", async () => {
+      process.env.REFUND_MAX_CENTS = "99999999";
+      paidOrder(1999);
+      const res = await refund(20);
+      expect(res.status).toBe(422);
+      expectNothingProcessedOrWritten();
+    });
+
+    it("keeps existing 400/404/409 validation ahead of the ceiling", async () => {
+      process.env.REFUND_MAX_CENTS = "100";
+
+      const nonPositive = await refund(-1000);
+      expect(nonPositive.status).toBe(400);
+
+      mockedQuery.mockResolvedValueOnce([]);
+      const missing = await refund(1000);
+      expect(missing.status).toBe(404);
+
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 1000000, status: "cancelled" },
+      ]);
+      const notRefundable = await refund(1000);
+      expect(notRefundable.status).toBe(409);
+
+      expectNothingProcessedOrWritten();
     });
   });
 
