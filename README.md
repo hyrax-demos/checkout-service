@@ -28,6 +28,7 @@ The service listens on `:3000` by default.
 | GET    | `/orders/:id`               | Fetch a single order                 |
 | GET    | `/orders`                   | List the caller's orders             |
 | POST   | `/orders`                   | Create an order                      |
+| POST   | `/orders/:id/cancel`        | Cancel an order (refunds if paid)    |
 | POST   | `/payments/charge`          | Capture payment for an order         |
 | POST   | `/payments/capture-batch`   | Capture several orders at once       |
 | POST   | `/refunds`                  | Refund a paid order (full or partial)|
