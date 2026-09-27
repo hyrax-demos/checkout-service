@@ -11,11 +11,24 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +48,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +140,59 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    describe("amount units", () => {
+      // Route the order lookup by SQL text (see the full-refund test above)
+      // so this stays valid if later work adds a prior-refunds query.
+      function paidOrder(total: number) {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total, status: "paid" }];
+          }
+          return [];
+        });
+      }
+
+      function insertedRefundAmount(client: { query: ReturnType<typeof vi.fn> }) {
+        const insert = client.query.mock.calls
+          .map((c) => c[0] as { text: string; values: unknown[] })
+          .find((q) => q.text.includes("INSERT INTO refunds"));
+        expect(insert).toBeDefined();
+        // Values are (id, order_id, amount).
+        return insert!.values[2];
+      }
+
+      it("passes integer cents to refundProcessor (12.34 dollars -> 1234)", async () => {
+        paidOrder(5000);
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 12.34 });
+        expect(res.status).toBe(200);
+        expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+        expect(mockedRefundProcessor).toHaveBeenCalledWith(
+          expect.objectContaining({ orderId: "order-1", amount: 1234 })
+        );
+        expect(insertedRefundAmount(client)).toBe(1234);
+        expect(res.body.amount).toBe(1234);
+      });
+
+      it("rounds float artefacts to exact cents (0.29 dollars -> 29)", async () => {
+        // 0.29 * 100 === 28.999999999999996 in IEEE-754.
+        paidOrder(5000);
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 0.29 });
+        expect(res.status).toBe(200);
+        const { amount } = mockedRefundProcessor.mock.calls[0][0];
+        expect(amount).toBe(29);
+        expect(Number.isInteger(amount)).toBe(true);
+        expect(insertedRefundAmount(client)).toBe(29);
+      });
     });
   });
 
