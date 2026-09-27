@@ -104,6 +104,47 @@ describe("payments routes", () => {
       expect(res.status).toBe(409);
     });
 
+    it("rejects a refund above the default platform ceiling ($500.00) even when the order total is higher", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 100000, status: "paid" },
+      ]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 500.01 });
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("allows a refund exactly at the default platform ceiling ($500.00)", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 100000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 500 });
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(50000);
+    });
+
+    it("still enforces the order-total limit when it is lower than the platform ceiling", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 1000, status: "paid" },
+      ]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 15 });
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe("refund exceeds order total");
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
     it("refunds a paid order for its full amount", async () => {
       // Routed by SQL text rather than call order: a correct fix for M3 (see
       // bench task M3) adds a query for the order's prior refund total
