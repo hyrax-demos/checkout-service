@@ -333,6 +333,80 @@ describe("payments routes", () => {
         expect(sumIdx).toBeGreaterThanOrEqual(0);
         expect(sumIdx).toBeLessThan(insertIdx);
       });
+
+      it("locks the order row before reading the prior total", async () => {
+        const { client } = refundsStore(1000, [600]);
+        const res = await refundCents(400);
+        expect(res.status).toBe(200);
+        const calls = client.query.mock.calls.map(
+          ([q]: [{ text: string; values: unknown[] }]) => q
+        );
+        const lockIdx = calls.findIndex(
+          (q) => q.text.includes("FROM orders") && q.text.includes("FOR UPDATE")
+        );
+        const sumIdx = calls.findIndex((q) => q.text.includes("SUM(amount)"));
+        expect(lockIdx).toBeGreaterThanOrEqual(0);
+        expect(calls[lockIdx].values).toEqual(["order-1"]);
+        expect(lockIdx).toBeLessThan(sumIdx);
+      });
+
+      it("serialises concurrent refunds so together they cannot exceed the total", async () => {
+        // Emulates Postgres row locking: `FOR UPDATE` on an order blocks until
+        // the transaction holding that lock finishes. A slow processor makes
+        // the two requests overlap, so without the lock both would read a
+        // prior total of 0 and both would be accepted.
+        const rows: { id: string; order_id: string; amount: number }[] = [];
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1000, status: "paid" }];
+          }
+          return [];
+        });
+        let lockTail: Promise<void> = Promise.resolve();
+        mockedWithTransaction.mockImplementation(async (fn: any) => {
+          let release: () => void = () => {};
+          const client = {
+            query: vi.fn(async (q: { text: string; values: unknown[] }) => {
+              if (q.text.includes("FOR UPDATE")) {
+                const prev = lockTail;
+                lockTail = new Promise<void>((r) => (release = r));
+                await prev;
+                return [{ id: q.values[0] }];
+              }
+              if (q.text.includes("SUM(amount)")) {
+                const sum = rows
+                  .filter((r) => r.order_id === q.values[0])
+                  .reduce((acc, r) => acc + r.amount, 0);
+                return [{ total: String(sum) }];
+              }
+              if (q.text.includes("INSERT INTO refunds")) {
+                const [id, order_id, amount] = q.values as [string, string, number];
+                rows.push({ id, order_id, amount });
+              }
+              return [];
+            }),
+          };
+          try {
+            return await fn(client);
+          } finally {
+            release();
+          }
+        });
+        mockedRefundProcessor.mockImplementation(
+          () => new Promise((r) => setTimeout(r, 20))
+        );
+
+        try {
+          const results = await Promise.all([refundCents(600), refundCents(600)]);
+          const statuses = results.map((r) => r.status).sort();
+          expect(statuses).toEqual([200, 422]);
+          expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+          expect(rows.map((r) => r.amount)).toEqual([600]);
+        } finally {
+          mockedRefundProcessor.mockReset();
+          mockedRefundProcessor.mockResolvedValue(undefined);
+        }
+      });
     });
 
     describe("order status after a refund", () => {

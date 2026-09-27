@@ -80,7 +80,12 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const accepted = await withTransaction(async (client) => {
     // Refunds already issued against this order count toward its total, so
     // a series of partial refunds can never add up to more than was captured.
-    // Read inside the transaction that records this refund.
+    // Lock the order row first so concurrent refunds for the same order are
+    // serialised: a second transaction blocks here until the first commits,
+    // and its SUM below (a fresh statement under READ COMMITTED) then sees
+    // the committed refund row. Without the lock, two concurrent requests
+    // could each read the same prior total and together over-refund.
+    await lockOrderForRefund(client, order.id);
     const priorRefundedCents = await getRefundedTotalCents(client, order.id);
     if (priorRefundedCents + amountCents > order.total) {
       return false;
@@ -112,6 +117,16 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
+
+// Take a row-level lock on the order for the rest of the enclosing
+// transaction. Held until COMMIT/ROLLBACK, so the prior-refund read, the
+// processor call and the refund insert happen as one step per order.
+async function lockOrderForRefund(
+  client: Pick<TransactionClient, "query">,
+  orderId: string
+): Promise<void> {
+  await client.query(sql`SELECT id FROM orders WHERE id = ${orderId} FOR UPDATE`);
+}
 
 // Sum of every refund already recorded against an order, in integer cents
 // (0 when there are none). Postgres returns SUM over an integer column as
