@@ -19,10 +19,26 @@ export function signToken(userId: string): string {
 // Verify a session token and return its claims. Throws if the signature is
 // invalid, the algorithm is unexpected, or the token has expired.
 export function verifyToken(token: string): { sub: string } {
-  return jwt.verify(token, config.jwtSecret, {
+  const payload = jwt.verify(token, config.jwtSecret, {
     algorithms: ["HS256"],
     // Allow a little slack for clock drift between the API nodes and the
-    // clients that mint refresh requests.
+    // clients that mint refresh requests (applies to `nbf`).
     clockTolerance: CLOCK_SKEW_TOLERANCE_SECONDS,
-  }) as { sub: string };
+    // `jsonwebtoken` rejects once `now >= exp + clockTolerance`, i.e. a token
+    // expired exactly CLOCK_SKEW_TOLERANCE_SECONDS ago would be rejected. We
+    // want that boundary to be inclusive, so `exp` is enforced below instead.
+    ignoreExpiration: true,
+  }) as jwt.JwtPayload & { sub: string };
+
+  if (payload.exp !== undefined) {
+    if (typeof payload.exp !== "number") {
+      throw new jwt.JsonWebTokenError("invalid exp value");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (now > payload.exp + CLOCK_SKEW_TOLERANCE_SECONDS) {
+      throw new jwt.TokenExpiredError("jwt expired", new Date(payload.exp * 1000));
+    }
+  }
+
+  return payload;
 }
