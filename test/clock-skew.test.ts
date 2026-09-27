@@ -3,23 +3,12 @@ import jwt from "jsonwebtoken";
 import type { Response, NextFunction } from "express";
 import { verifyToken } from "../src/auth";
 import { authenticate, AuthedRequest } from "../src/middleware/authenticate";
+import { tokenExpiredSecondsAgo } from "./helpers/token";
 
 // Session tokens may be accepted for at most 60 seconds past `exp` to absorb
 // clock drift. Anything older must be rejected by every verification path.
-
-function tokenExpiredSecondsAgo(secondsAgo: number, role?: string): string {
-  const now = Math.floor(Date.now() / 1000);
-  return jwt.sign(
-    {
-      sub: "user-skew",
-      ...(role ? { role } : {}),
-      iat: now - 3600 - secondsAgo,
-      exp: now - secondsAgo,
-    },
-    process.env.JWT_SECRET as string,
-    { algorithm: "HS256" }
-  );
-}
+// The same boundary is also covered directly against src/utils/jwt.ts in
+// test/jwt.test.ts; these cases stay to pin both public entry points.
 
 function runMiddleware(token: string) {
   const req = {
@@ -59,7 +48,7 @@ describe("session token clock-skew tolerance", () => {
       "responds 401 for a token that expired %i seconds ago",
       (secondsAgo) => {
         const { req, res, next } = runMiddleware(
-          tokenExpiredSecondsAgo(secondsAgo, "admin")
+          tokenExpiredSecondsAgo(secondsAgo, { role: "admin" })
         );
         expect(next).not.toHaveBeenCalled();
         expect(res.status).toHaveBeenCalledWith(401);
@@ -73,7 +62,7 @@ describe("session token clock-skew tolerance", () => {
       "accepts a token that expired %i seconds ago",
       (secondsAgo) => {
         const { req, res, next } = runMiddleware(
-          tokenExpiredSecondsAgo(secondsAgo, "admin")
+          tokenExpiredSecondsAgo(secondsAgo, { role: "admin" })
         );
         expect(next).toHaveBeenCalledTimes(1);
         expect(next).toHaveBeenCalledWith();
