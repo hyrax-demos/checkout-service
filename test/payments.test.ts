@@ -334,6 +334,94 @@ describe("payments routes", () => {
         expect(sumIdx).toBeLessThan(insertIdx);
       });
     });
+
+    describe("order status after a refund", () => {
+      // Like the cumulative-guard store above, but the fake transaction client
+      // also applies `UPDATE orders SET status = ...` to an in-memory order, so
+      // tests can check the status after each request.
+      function orderStore(total: number, status: string) {
+        const order = { id: "order-1", total, status };
+        const rows: { id: string; order_id: string; amount: number }[] = [];
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ ...order }];
+          }
+          return [];
+        });
+        const client = {
+          query: vi.fn(async (q: { text: string; values: unknown[] }) => {
+            if (q.text.includes("SUM(amount)") && q.text.includes("FROM refunds")) {
+              const sum = rows
+                .filter((r) => r.order_id === q.values[0])
+                .reduce((acc, r) => acc + r.amount, 0);
+              return [{ total: String(sum) }];
+            }
+            if (q.text.includes("INSERT INTO refunds")) {
+              const [id, order_id, amount] = q.values as [string, string, number];
+              rows.push({ id, order_id, amount });
+            }
+            if (q.text.includes("UPDATE orders SET status = 'refunded'")) {
+              if (q.values[0] === order.id) order.status = "refunded";
+            }
+            return [];
+          }),
+        };
+        mockedWithTransaction.mockImplementation(async (fn: any) => fn(client));
+        return { order, rows, client };
+      }
+
+      function statusUpdates(client: { query: ReturnType<typeof vi.fn> }) {
+        return client.query.mock.calls
+          .map(([q]: [{ text: string }]) => q)
+          .filter((q) => q.text.includes("UPDATE orders"));
+      }
+
+      async function refundCents(cents: number) {
+        return request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: cents / 100 });
+      }
+
+      it("leaves the status unchanged after a partial refund", async () => {
+        const { order, rows, client } = orderStore(1000, "paid");
+        const res = await refundCents(400);
+        expect(res.status).toBe(200);
+        expect(res.body.refunded).toBe(true);
+        expect(res.body.amount).toBe(400);
+        expect(rows.map((r) => r.amount)).toEqual([400]);
+        expect(order.status).toBe("paid");
+        expect(statusUpdates(client)).toHaveLength(0);
+        // Nor is the status written outside the transaction.
+        const outside = mockedQuery.mock.calls.filter(([q]) =>
+          q.text.includes("UPDATE orders")
+        );
+        expect(outside).toHaveLength(0);
+      });
+
+      it("sets the status to refunded after a single full refund", async () => {
+        const { order, client } = orderStore(1000, "paid");
+        const res = await refundCents(1000);
+        expect(res.status).toBe(200);
+        expect(order.status).toBe("refunded");
+        expect(statusUpdates(client)).toHaveLength(1);
+      });
+
+      it("sets refunded only once two partial refunds reach the total", async () => {
+        const { order, rows, client } = orderStore(1000, "paid");
+
+        const first = await refundCents(600);
+        expect(first.status).toBe(200);
+        expect(order.status).toBe("paid");
+        expect(statusUpdates(client)).toHaveLength(0);
+
+        const second = await refundCents(400);
+        expect(second.status).toBe(200);
+        expect(order.status).toBe("refunded");
+        expect(statusUpdates(client)).toHaveLength(1);
+        expect(rows.map((r) => r.amount)).toEqual([600, 400]);
+      });
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
