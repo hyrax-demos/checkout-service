@@ -34,6 +34,15 @@ The service listens on `:3000` by default.
 | POST   | `/webhooks/processor`       | Processor status callbacks (signed)  |
 | POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
 | POST   | `/admin/credits`            | Issue a manual account credit        |
+| GET    | `/admin/audit`              | Money-movement audit log (paginated) |
+
+## Audit log
+
+Charges, refunds and capture-batch captures each write a row to
+`audit_events` in the same statement or transaction as the change they
+record. Create the table with `migrations/001_create_audit_events.sql`.
+`GET /admin/audit?limit=&offset=` (admin only) lists events newest first:
+`limit` defaults to 50 and is capped at 200.
 
 ## Deployment
 

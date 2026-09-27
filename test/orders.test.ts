@@ -90,4 +90,80 @@ describe("orders routes", () => {
     expect(res.status).toBe(201);
     expect(res.body).toMatchObject({ id: "order-new", status: "pending" });
   });
+
+  describe("POST /orders input validation", () => {
+    const validItems = [{ sku: "sku-1", quantity: 1, unitPrice: 500 }];
+
+    const invalidBodies: Array<[string, Record<string, unknown>]> = [
+      ["items is missing", { total: 500 }],
+      ["items is empty", { total: 500, items: [] }],
+      ["items is not an array", { total: 500, items: { sku: "sku-1" } }],
+      ["items is a string", { total: 500, items: "sku-1" }],
+      ["total is missing", { items: validItems }],
+      ["total is zero", { total: 0, items: validItems }],
+      ["total is negative", { total: -100, items: validItems }],
+      ["total is fractional", { total: 10.5, items: validItems }],
+      ["total is a numeric string", { total: "500", items: validItems }],
+      ["total is null", { total: null, items: validItems }],
+    ];
+
+    it.each(invalidBodies)("returns 400 when %s", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("error");
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 when the body is empty", async () => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`);
+      expect(res.status).toBe(400);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["items is missing", { total: 500 }],
+      ["items is empty", { total: 500, items: [] }],
+      ["items is not an array", { total: 500, items: { sku: "sku-1" } }],
+    ])("keeps the items error message when %s", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "items must be a non-empty array" });
+    });
+
+    it.each([
+      ["total is missing", { items: validItems }],
+      ["total is zero", { total: 0, items: validItems }],
+      ["total is fractional", { total: 10.5, items: validItems }],
+      ["total is a numeric string", { total: "500", items: validItems }],
+    ])("keeps the total error message when %s", async (_label, body) => {
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send(body);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({
+        error: "total must be a positive integer number of cents",
+      });
+    });
+
+    it("accepts the smallest positive total", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-min", total: 1, items: validItems, status: "pending" },
+      ]);
+      const res = await request(app)
+        .post("/orders")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ total: 1, items: validItems });
+      expect(res.status).toBe(201);
+      expect(mockedQuery).toHaveBeenCalledTimes(1);
+    });
+  });
 });
