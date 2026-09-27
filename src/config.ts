@@ -12,6 +12,31 @@ function required(name: string): string {
   return value;
 }
 
+// Platform-wide ceiling on a single refund, in integer cents ($500.00).
+export const DEFAULT_REFUND_MAX_CENTS = 50000;
+
+// Parse the REFUND_MAX_CENTS setting. Unset or empty falls back to the
+// default; anything else must be a positive integer number of cents. A
+// malformed value throws rather than silently disabling or loosening the
+// ceiling.
+export function parseRefundMaxCents(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_REFUND_MAX_CENTS;
+  }
+  const trimmed = raw.trim();
+  const value = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `invalid REFUND_MAX_CENTS: expected a positive integer number of cents, got ${JSON.stringify(raw)}`
+    );
+  }
+  return value;
+}
+
+// Validate at boot so a misconfigured ceiling fails fast like the other
+// settings.
+parseRefundMaxCents(process.env.REFUND_MAX_CENTS);
+
 export const config = {
   port: process.env.PORT ? Number(process.env.PORT) : 3000,
 
@@ -30,4 +55,11 @@ export const config = {
 
   // Shared secret used to verify processor webhook signatures.
   webhookSecret: required("WEBHOOK_SECRET"),
+
+  // Hard ceiling (integer cents) on any single refund issued via
+  // `POST /refunds`. Applies in addition to the order-total limit. Read on
+  // access so the value always reflects the current environment.
+  get refundMaxCents(): number {
+    return parseRefundMaxCents(process.env.REFUND_MAX_CENTS);
+  },
 };
