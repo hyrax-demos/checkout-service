@@ -22,6 +22,38 @@ function headerValue(req: Request, name: string): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+// Apply an event's side effects. Returns an error response to send when the
+// event is rejected, or undefined when it was handled.
+async function handleEvent(
+  event: ProcessorEvent
+): Promise<{ status: number; error: string } | undefined> {
+  switch (event.type) {
+    case "charge.succeeded": {
+      // Only a 'pending' order may become 'paid'. An invalid transition
+      // leaves the order untouched. An unknown order keeps the prior
+      // behaviour (acknowledged, no-op).
+      const result = await markPaid(event.data.orderId as string);
+      if (!result.ok && result.reason === "invalid_transition") {
+        return { status: 409, error: "order is not awaiting payment" };
+      }
+      break;
+    }
+    case "charge.refunded":
+      await query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${event.data.orderId}`
+      );
+      break;
+    case "credit.issued":
+      // The processor applies a goodwill credit to the customer's balance;
+      // mirror it into our account_credits ledger.
+      await query(
+        sql`INSERT INTO account_credits (customer_id, amount) VALUES (${event.data.customerId}, ${event.data.amount})`
+      );
+      break;
+  }
+  return undefined;
+}
+
 // Receive asynchronous status updates from the payment processor. The body is
 // read as a raw buffer (whatever the content type) so the signature can be
 // checked against the exact bytes the processor signed. This router is mounted
@@ -58,41 +90,34 @@ webhook.post(
       return res.status(400).json({ error: "missing event id" });
     }
 
-    // (4) Replay: an already-processed event is acknowledged without
-    // re-running any side effects.
-    if (await processedEvents.has(event.id)) {
+    // (4) Replay: claim the id atomically before any side effect runs.
+    // Checking and reserving in one step means two concurrent deliveries of
+    // the same event cannot both get past this point.
+    const claim = await processedEvents.begin(event.id);
+    if (claim === "done") {
       return res.json({ received: true, duplicate: true });
     }
-
-    // (5) Handle the event.
-    switch (event.type) {
-      case "charge.succeeded": {
-        // Only a 'pending' order may become 'paid'. An invalid transition
-        // leaves the order untouched and is not recorded as processed. An
-        // unknown order keeps the prior behaviour (acknowledged, no-op).
-        const result = await markPaid(event.data.orderId as string);
-        if (!result.ok && result.reason === "invalid_transition") {
-          return res.status(409).json({ error: "order is not awaiting payment" });
-        }
-        break;
-      }
-      case "charge.refunded":
-        await query(
-          sql`UPDATE orders SET status = 'refunded' WHERE id = ${event.data.orderId}`
-        );
-        break;
-      case "credit.issued":
-        // The processor applies a goodwill credit to the customer's balance;
-        // mirror it into our account_credits ledger.
-        await query(
-          sql`INSERT INTO account_credits (customer_id, amount) VALUES (${event.data.customerId}, ${event.data.amount})`
-        );
-        break;
+    if (claim === "in_progress") {
+      // A concurrent delivery owns this id. Answer non-2xx so the processor
+      // retries later: it then sees "done", or can claim the id itself if
+      // the other attempt failed.
+      return res.status(409).json({ error: "event is already being processed" });
     }
 
-    // (6) Record the id only after handling succeeded, so a failed attempt
-    // (handler threw) stays retryable by the processor.
-    await processedEvents.add(event.id);
+    // (5) Handle the event. (6) Record the id as processed only if handling
+    // succeeded. On any other exit (409 or a thrown error) the claim is
+    // released so the processor can retry the delivery.
+    let handled = false;
+    try {
+      const rejection = await handleEvent(event);
+      if (rejection) {
+        return res.status(rejection.status).json({ error: rejection.error });
+      }
+      await processedEvents.complete(event.id);
+      handled = true;
+    } finally {
+      if (!handled) await processedEvents.release(event.id);
+    }
 
     res.json({ received: true });
   }

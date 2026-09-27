@@ -231,6 +231,53 @@ describe("processor webhook", () => {
     expect(mockedQuery).toHaveBeenCalledTimes(1);
   });
 
+  it("applies concurrent deliveries of the same event exactly once", async () => {
+    // Hold the first delivery inside its order update so the second one
+    // arrives while the first is still being handled.
+    const baseImpl = mockedQuery.getMockImplementation()!;
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    let entered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => (entered = resolve));
+    mockedQuery.mockImplementation(async (q: { text: string; values: unknown[] }) => {
+      entered();
+      await gate;
+      return baseImpl(q);
+    });
+
+    const first = sendEvent(app, chargeSucceeded).then((r) => r);
+    await firstEntered;
+    const second = await sendEvent(app, chargeSucceeded);
+    releaseFirst();
+    const firstRes = await first;
+
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body).toEqual({ received: true });
+    // The overlapping delivery gets a non-2xx response so the processor
+    // retries it, and it causes no side effects.
+    expect(second.status).toBe(409);
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+    expect(orderStatus.get("order-1")).toBe("paid");
+
+    // Once the first attempt completes, a later retry is a plain duplicate.
+    const retry = await sendEvent(app, chargeSucceeded);
+    expect(retry.status).toBe(200);
+    expect(retry.body).toEqual({ received: true, duplicate: true });
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the claim when handling is rejected so a retry can succeed", async () => {
+    orderStatus.set("order-1", "cancelled");
+    const rejected = await sendEvent(app, chargeSucceeded);
+    expect(rejected.status).toBe(409);
+
+    orderStatus.set("order-1", "pending");
+    const retry = await sendEvent(app, chargeSucceeded);
+    expect(retry.status).toBe(200);
+    expect(retry.body).toEqual({ received: true });
+    expect(orderStatus.get("order-1")).toBe("paid");
+  });
+
   it("rejects a signed event with no id with 400", async () => {
     const res = await sendEvent(app, { type: "charge.succeeded", data: { orderId: "order-1" } });
     expect(res.status).toBe(400);
