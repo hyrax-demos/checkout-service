@@ -35,6 +35,13 @@ The service listens on `:3000` by default.
 | POST   | `/admin/orders/purge`       | Remove cancelled orders (internal)   |
 | POST   | `/admin/credits`            | Issue a manual account credit        |
 
+### Refund limits
+
+`POST /refunds` rejects (HTTP 422) any refund that exceeds either the order's
+captured total or the platform-wide ceiling set by `REFUND_MAX_CENTS`
+(integer cents; defaults to `50000`, i.e. $500.00, when unset or empty). The
+lower of the two limits is always the binding one.
+
 ## Deployment
 
 Built with `npm run build`, deployed as a container behind the storefront ALB.
