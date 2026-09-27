@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
 import { query, sql, withTransaction } from "../db";
+import type { TransactionClient } from "../db";
 import { config } from "../config";
 import { AuthedRequest } from "../middleware/authenticate";
 import { chargeIdempotencyKey, newId } from "../utils/tokens";
@@ -54,6 +55,10 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
+  // Convert once to integer cents; everything below (the order.total
+  // comparison, the processor call and the refunds row) is denominated in
+  // cents. Math.round absorbs floating-point error (e.g. 0.29 * 100).
+  const amountCents = Math.round(amountDollars * 100);
 
   const rows = await query<Order>(
     sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
@@ -66,30 +71,81 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
     return res.status(409).json({ error: "order is not refundable" });
   }
 
-  const amountCents = Math.round(amountDollars * 100);
-
   // A refund may not exceed the order's captured total.
   if (amountCents > order.total) {
     return res.status(422).json({ error: "refund exceeds order total" });
   }
 
   const refundId = newId();
-  await withTransaction(async (client) => {
+  const accepted = await withTransaction(async (client) => {
+    // Refunds already issued against this order count toward its total, so
+    // a series of partial refunds can never add up to more than was captured.
+    // Lock the order row first so concurrent refunds for the same order are
+    // serialised: a second transaction blocks here until the first commits,
+    // and its SUM below (a fresh statement under READ COMMITTED) then sees
+    // the committed refund row. Without the lock, two concurrent requests
+    // could each read the same prior total and together over-refund.
+    await lockOrderForRefund(client, order.id);
+    const priorRefundedCents = await getRefundedTotalCents(client, order.id);
+    if (priorRefundedCents + amountCents > order.total) {
+      return false;
+    }
+
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents,
       apiKey: config.paymentApiKey,
     });
     await client.query(
       sql`INSERT INTO refunds (id, order_id, amount) VALUES (${refundId}, ${order.id}, ${amountCents})`
     );
-    await client.query(
-      sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
-    );
+    // Only a refund that brings the cumulative refunded total up to the
+    // captured total marks the order refunded; a partial refund leaves the
+    // order's status as it was. priorRefundedCents was read in this same
+    // transaction, so prior + this is the post-insert total.
+    if (priorRefundedCents + amountCents >= order.total) {
+      await client.query(
+        sql`UPDATE orders SET status = 'refunded' WHERE id = ${order.id}`
+      );
+    }
+    return true;
   });
+
+  if (!accepted) {
+    return res.status(422).json({ error: "refund exceeds order total" });
+  }
 
   res.json({ refunded: true, refundId, amount: amountCents });
 });
+
+// Take a row-level lock on the order for the rest of the enclosing
+// transaction. Held until COMMIT/ROLLBACK, so the prior-refund read, the
+// processor call and the refund insert happen as one step per order.
+async function lockOrderForRefund(
+  client: Pick<TransactionClient, "query">,
+  orderId: string
+): Promise<void> {
+  await client.query(sql`SELECT id FROM orders WHERE id = ${orderId} FOR UPDATE`);
+}
+
+// Sum of every refund already recorded against an order, in integer cents
+// (0 when there are none). Postgres returns SUM over an integer column as
+// numeric/bigint, which `pg` hands back as a string, so coerce explicitly and
+// refuse to proceed on anything that is not a finite number.
+async function getRefundedTotalCents(
+  client: Pick<TransactionClient, "query">,
+  orderId: string
+): Promise<number> {
+  const rows = await client.query<{ total: string | number | null }>(
+    sql`SELECT COALESCE(SUM(amount), 0) AS total FROM refunds WHERE order_id = ${orderId}`
+  );
+  const raw = rows[0]?.total ?? 0;
+  const total = Number(raw);
+  if (!Number.isFinite(total)) {
+    throw new Error(`invalid refunded total for order ${orderId}: ${String(raw)}`);
+  }
+  return total;
+}
 
 // Capture payment for several orders in one request (used by the back-office
 // "settle outstanding" batch action).
