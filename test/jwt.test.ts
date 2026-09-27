@@ -52,6 +52,16 @@ describe("src/utils/jwt", () => {
       }
     );
 
+    it("accepts a token that expired exactly 60 seconds ago", () => {
+      const token = tokenExpiredSecondsAgo(60, { now: NOW_SECONDS });
+      expect(verifyToken(token).sub).toBe("user-skew");
+    });
+
+    it("rejects a token that expired 60.5 seconds ago", () => {
+      const token = tokenExpiredSecondsAgo(60.5, { now: NOW_SECONDS });
+      expect(() => verifyToken(token)).toThrow(jwt.TokenExpiredError);
+    });
+
     it.each([-1, -60, -3600])(
       "accepts a token that is not yet expired (exp in %i seconds ago)",
       (secondsAgo) => {
