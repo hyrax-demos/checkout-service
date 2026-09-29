@@ -12,6 +12,7 @@ vi.mock("../src/db", () => ({
 }));
 
 import { query, withTransaction } from "../src/db";
+import * as processor from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
@@ -126,6 +127,38 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("passes the refund amount to the processor in integer cents", async () => {
+      const refundSpy = vi.spyOn(processor, "refundProcessor");
+      try {
+        mockedQuery.mockImplementation(async (q: { text: string }) => {
+          if (q.text.includes("FROM orders")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          return [];
+        });
+        const client = fakeTransaction();
+        const res = await request(app)
+          .post("/refunds")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ reference: "ord_abc", amountDollars: 12.5 });
+        expect(res.status).toBe(200);
+        expect(refundSpy).toHaveBeenCalledTimes(1);
+        expect(refundSpy.mock.calls[0][0]).toMatchObject({
+          orderId: "order-1",
+          amount: 1250,
+        });
+        expect(Number.isInteger(refundSpy.mock.calls[0][0].amount)).toBe(true);
+        // The processor, the stored refund row, and the response agree.
+        const insert = client.query.mock.calls.find(([q]: any[]) =>
+          q.text.includes("INSERT INTO refunds")
+        );
+        expect(insert?.[0].values).toContain(1250);
+        expect(res.body.amount).toBe(1250);
+      } finally {
+        refundSpy.mockRestore();
+      }
     });
   });
 
