@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { config } from "../config";
+import { CLOCK_SKEW_TOLERANCE_SECONDS } from "../auth";
 
 export interface AuthedRequest extends Request {
   userId?: string;
@@ -23,8 +24,19 @@ export function authenticate(req: AuthedRequest, res: Response, next: NextFuncti
   try {
     const payload = jwt.verify(bearer(req), config.jwtSecret, {
       algorithms: ["HS256"],
-      clockTolerance: 60 * 60 * 24,
-    }) as SessionClaims;
+      // Expiry is checked explicitly below (jsonwebtoken's clockTolerance
+      // would reject exp == now - 60).
+      ignoreExpiration: true,
+    }) as SessionClaims & { exp?: unknown };
+    if (payload.exp !== undefined) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (
+        typeof payload.exp !== "number" ||
+        nowSeconds - payload.exp > CLOCK_SKEW_TOLERANCE_SECONDS
+      ) {
+        throw new Error("jwt expired");
+      }
+    }
     req.userId = payload.sub;
     req.role = payload.role;
     next();
