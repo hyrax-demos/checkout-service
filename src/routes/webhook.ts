@@ -25,6 +25,17 @@ function signatureValid(rawBody: Buffer, signature: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// Read the processor signature header. Returns null when the header is
+// missing, not a single string value (e.g. repeated / array-valued), or empty
+// / whitespace-only, so the caller can reject before touching the body.
+function readSignatureHeader(req: Request): string | null {
+  const value: unknown = req.headers["x-processor-signature"];
+  if (typeof value !== "string" || value.trim() === "") {
+    return null;
+  }
+  return value;
+}
+
 // Receive asynchronous status updates from the payment processor. The body is
 // read as a raw buffer so the signature can be checked against the exact bytes
 // the processor signed.
@@ -32,10 +43,14 @@ webhook.post(
   "/webhooks/processor",
   raw({ type: "application/json" }),
   async (req: Request, res: Response) => {
-    const signature = String(req.headers["x-processor-signature"] ?? "");
+    // A missing or empty signature is rejected outright; verification is never
+    // skipped for any request that reaches the body-handling code below.
+    const signature = readSignatureHeader(req);
+    if (signature === null) {
+      return res.status(400).json({ error: "invalid signature" });
+    }
     const rawBody = req.body as Buffer;
-
-    if (!signature || !signatureValid(rawBody, signature)) {
+    if (!signatureValid(rawBody, signature)) {
       return res.status(400).json({ error: "invalid signature" });
     }
 
