@@ -11,11 +11,24 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Mocked so tests can assert on the exact args `refundProcessor` receives
+// (in particular, that `amount` is in cents, matching its documented
+// contract) without depending on the real (no-op) implementation.
+vi.mock("../src/processor", () => ({
+  ProcessorError: class ProcessorError extends Error {},
+  chargeProcessor: vi.fn(),
+  refundProcessor: vi.fn(),
+}));
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
+  typeof vi.fn
+>;
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -35,6 +48,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockReset();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +140,49 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("calls refundProcessor with the amount in cents, not dollars", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+
+      expect(res.status).toBe(200);
+      // 19.99 dollars must reach the processor as 1999 cents (its documented
+      // contract, matching how chargeProcessor is already called elsewhere
+      // in this file) rather than as the raw 19.99 dollar value.
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ orderId: "order-1", amount: 1999 })
+      );
+    });
+
+    it("converts a partial refund amount to cents for refundProcessor", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 5000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 12.5 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.amount).toBe(1250);
+      expect(mockedRefundProcessor).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 1250 })
+      );
     });
   });
 
