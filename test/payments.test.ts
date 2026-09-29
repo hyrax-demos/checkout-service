@@ -13,6 +13,7 @@ vi.mock("../src/db", () => ({
 
 import { query, withTransaction } from "../src/db";
 import { buildApp } from "./helpers/app";
+import * as processor from "../src/processor";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -72,6 +73,31 @@ describe("payments routes", () => {
       // Two DB round-trips: look up the order, then flip it to paid. The
       // idempotency key's exact value is a task target, not a baseline.
       expect(mockedQuery).toHaveBeenCalledTimes(2);
+    });
+
+    it("sends the same idempotency key when a charge is retried later", async () => {
+      const spy = vi.spyOn(processor, "chargeProcessor");
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const keys: string[] = [];
+        for (const when of ["2024-01-01T00:00:00Z", "2024-01-01T00:05:00Z"]) {
+          vi.setSystemTime(new Date(when));
+          mockedQuery.mockResolvedValueOnce([
+            { id: "order-1", total: 1999, status: "pending" },
+          ]);
+          mockedQuery.mockResolvedValueOnce([]);
+          const res = await request(app)
+            .post("/payments/charge")
+            .set("Authorization", `Bearer ${token}`)
+            .send({ orderId: "order-1" });
+          expect(res.status).toBe(200);
+          keys.push(spy.mock.calls.at(-1)![0].idempotencyKey);
+        }
+        expect(keys[0]).toBe(keys[1]);
+      } finally {
+        vi.useRealTimers();
+        spy.mockRestore();
+      }
     });
   });
 
