@@ -15,14 +15,27 @@ interface ProcessorEvent {
   };
 }
 
-// Verify the processor's HMAC signature over the raw request body.
+const HEX_RE = /^[0-9a-fA-F]+$/;
+
+// Verify the processor's HMAC signature over the raw request body, in constant
+// time. The signature must be strictly hex and exactly as long as the expected
+// digest's hex encoding; anything else is rejected before decoding. This matters
+// because Buffer.from(s, "hex") silently truncates at the first non-hex
+// character and drops a trailing odd nibble, so a lenient decode could accept a
+// tampered header. After these checks both buffers are guaranteed to be the
+// same length, so timingSafeEqual can never throw.
 function signatureValid(rawBody: Buffer, signature: string): boolean {
   const expected = createHmac("sha256", config.webhookSecret)
     .update(rawBody)
-    .digest("hex");
-  const a = Buffer.from(signature, "hex");
-  const b = Buffer.from(expected, "hex");
-  return a.length === b.length && timingSafeEqual(a, b);
+    .digest();
+  if (signature.length !== expected.length * 2 || !HEX_RE.test(signature)) {
+    return false;
+  }
+  const received = Buffer.from(signature, "hex");
+  if (received.length !== expected.length) {
+    return false;
+  }
+  return timingSafeEqual(received, expected);
 }
 
 // Receive asynchronous status updates from the payment processor. The body is
