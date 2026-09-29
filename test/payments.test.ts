@@ -73,6 +73,30 @@ describe("payments routes", () => {
       // idempotency key's exact value is a task target, not a baseline.
       expect(mockedQuery).toHaveBeenCalledTimes(2);
     });
+
+    it("sends the same idempotency key when a charge is retried", async () => {
+      const processor = await import("../src/processor");
+      const spy = vi.spyOn(processor, "chargeProcessor");
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          mockedQuery.mockResolvedValueOnce([
+            { id: "order-1", total: 1999, status: "pending" },
+          ]);
+          mockedQuery.mockResolvedValueOnce([]);
+          const res = await request(app)
+            .post("/payments/charge")
+            .set("Authorization", `Bearer ${token}`)
+            .send({ orderId: "order-1" });
+          expect(res.status).toBe(200);
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        expect(spy).toHaveBeenCalledTimes(2);
+        const keys = spy.mock.calls.map((c) => c[0].idempotencyKey);
+        expect(keys[0]).toBe(keys[1]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   describe("POST /refunds", () => {
