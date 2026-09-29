@@ -77,7 +77,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   await withTransaction(async (client) => {
     await refundProcessor({
       orderId: order.id,
-      amount: amountDollars,
+      amount: amountCents, // cents, per RefundArgs contract
       apiKey: config.paymentApiKey,
     });
     await client.query(
