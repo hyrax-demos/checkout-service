@@ -63,4 +63,53 @@ describe("processor webhook", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true });
   });
+
+  const creditBody = JSON.stringify({
+    id: "evt_2",
+    type: "credit.issued",
+    data: { customerId: "cust-1", amount: 500 },
+  });
+
+  it("rejects a forged credit.issued with no signature header and writes nothing", async () => {
+    const res = await request(app)
+      .post("/webhooks/processor")
+      .set("Content-Type", "application/json")
+      .send(creditBody);
+    expect(res.status).toBe(400);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("rejects a forged credit.issued with an empty signature header and writes nothing", async () => {
+    const res = await request(app)
+      .post("/webhooks/processor")
+      .set("Content-Type", "application/json")
+      .set("x-processor-signature", "")
+      .send(creditBody);
+    expect(res.status).toBe(400);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("rejects a forged credit.issued with a whitespace-only signature header and writes nothing", async () => {
+    const res = await request(app)
+      .post("/webhooks/processor")
+      .set("Content-Type", "application/json")
+      .set("x-processor-signature", "   ")
+      .send(creditBody);
+    expect(res.status).toBe(400);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it("applies a correctly signed credit.issued event", async () => {
+    const res = await request(app)
+      .post("/webhooks/processor")
+      .set("Content-Type", "application/json")
+      .set("x-processor-signature", sign(creditBody))
+      .send(creditBody);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ received: true });
+    expect(mockedQuery).toHaveBeenCalledTimes(1);
+    const [stmt] = mockedQuery.mock.calls[0];
+    expect(stmt.text).toContain("INSERT INTO account_credits");
+    expect(stmt.values).toEqual(["cust-1", 500]);
+  });
 });

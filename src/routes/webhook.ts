@@ -32,10 +32,17 @@ webhook.post(
   "/webhooks/processor",
   raw({ type: "application/json" }),
   async (req: Request, res: Response) => {
-    const signature = String(req.headers["x-processor-signature"] ?? "");
-    const rawBody = req.body as Buffer;
+    // Reject unsigned requests up front, before the body is touched or any
+    // write can happen. A missing, empty, whitespace-only, or repeated header
+    // is never treated as "skip verification".
+    const header = req.headers["x-processor-signature"];
+    const signature = typeof header === "string" ? header.trim() : "";
+    if (signature === "") {
+      return res.status(400).json({ error: "missing signature" });
+    }
 
-    if (!signature || !signatureValid(rawBody, signature)) {
+    const rawBody = req.body;
+    if (!Buffer.isBuffer(rawBody) || !signatureValid(rawBody, signature)) {
       return res.status(400).json({ error: "invalid signature" });
     }
 
