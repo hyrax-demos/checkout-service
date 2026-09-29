@@ -11,8 +11,22 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+    refundProcessor: vi.fn(actual.refundProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { refundProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
+
+const mockedRefundProcessor = refundProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -35,6 +49,7 @@ describe("payments routes", () => {
   beforeEach(() => {
     mockedQuery.mockReset();
     mockedWithTransaction.mockReset();
+    mockedRefundProcessor.mockClear();
   });
 
   describe("POST /payments/charge", () => {
@@ -126,6 +141,81 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    function paidOrder(total: number) {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total, status: "paid" }];
+        }
+        return [];
+      });
+    }
+
+    it("passes the refund amount to the processor in integer cents", async () => {
+      paidOrder(1999);
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor).toHaveBeenCalledTimes(1);
+      expect(mockedRefundProcessor.mock.calls[0][0]).toMatchObject({
+        orderId: "order-1",
+        amount: 1999,
+      });
+      // The processor, the DB row and the response all agree on the unit.
+      const insert = client.query.mock.calls.find((c: any[]) =>
+        c[0].text.includes("INSERT INTO refunds")
+      );
+      expect(insert?.[0].values).toContain(1999);
+      expect(res.body.amount).toBe(1999);
+    });
+
+    it("passes a partial refund to the processor in cents", async () => {
+      paidOrder(1999);
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(500);
+      expect(Number.isInteger(mockedRefundProcessor.mock.calls[0][0].amount)).toBe(
+        true
+      );
+    });
+
+    it("rounds fractional-cent float artefacts to integer cents", async () => {
+      paidOrder(1000);
+      fakeTransaction();
+      // 0.29 * 100 === 28.999999999999996 in IEEE-754.
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 0.29 });
+      expect(res.status).toBe(200);
+      expect(mockedRefundProcessor.mock.calls[0][0].amount).toBe(29);
+    });
+
+    it("does not call the processor when the refund exceeds the order total", async () => {
+      paidOrder(1999);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 20 });
+      expect(res.status).toBe(422);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-numeric amount without calling the processor", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: "19.99" });
+      expect(res.status).toBe(400);
+      expect(mockedRefundProcessor).not.toHaveBeenCalled();
     });
   });
 
