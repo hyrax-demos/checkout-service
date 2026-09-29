@@ -11,10 +11,24 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+// Wrap the real processor functions in spies so tests can inspect the
+// arguments sent upstream without changing their behaviour.
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn(actual.chargeProcessor),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
+import { chargeProcessor } from "../src/processor";
 import { buildApp } from "./helpers/app";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
+const mockedChargeProcessor = chargeProcessor as unknown as ReturnType<
+  typeof vi.fn
+>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
   typeof vi.fn
 >;
@@ -72,6 +86,36 @@ describe("payments routes", () => {
       // Two DB round-trips: look up the order, then flip it to paid. The
       // idempotency key's exact value is a task target, not a baseline.
       expect(mockedQuery).toHaveBeenCalledTimes(2);
+    });
+
+    it("sends the same idempotency key when a charge is retried later", async () => {
+      mockedChargeProcessor.mockClear();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const pending = [{ id: "order-1", total: 1999, status: "pending" }];
+
+        vi.setSystemTime(new Date("2024-01-01T00:00:00Z"));
+        mockedQuery.mockResolvedValueOnce(pending).mockResolvedValueOnce([]);
+        await request(app)
+          .post("/payments/charge")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ orderId: "order-1" });
+
+        vi.setSystemTime(new Date("2024-01-01T00:05:00Z"));
+        mockedQuery.mockResolvedValueOnce(pending).mockResolvedValueOnce([]);
+        await request(app)
+          .post("/payments/charge")
+          .set("Authorization", `Bearer ${token}`)
+          .send({ orderId: "order-1" });
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(mockedChargeProcessor).toHaveBeenCalledTimes(2);
+      const [first, second] = mockedChargeProcessor.mock.calls.map(
+        (call) => call[0].idempotencyKey
+      );
+      expect(second).toBe(first);
     });
   });
 
