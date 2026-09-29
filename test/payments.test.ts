@@ -11,8 +11,18 @@ vi.mock("../src/db", () => ({
   withTransaction: vi.fn(),
 }));
 
+vi.mock("../src/processor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/processor")>();
+  return {
+    ...actual,
+    chargeProcessor: vi.fn().mockResolvedValue(undefined),
+    refundProcessor: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { query, withTransaction } from "../src/db";
 import { buildApp } from "./helpers/app";
+import { refundProcessor } from "../src/processor";
 
 const mockedQuery = query as unknown as ReturnType<typeof vi.fn>;
 const mockedWithTransaction = withTransaction as unknown as ReturnType<
@@ -126,6 +136,30 @@ describe("payments routes", () => {
       expect(res.body.refunded).toBe(true);
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
+    });
+
+    it("passes the refund amount to the processor in integer cents", async () => {
+      const spy = refundProcessor as unknown as ReturnType<typeof vi.fn>;
+      spy.mockClear();
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 12.34 });
+      expect(res.status).toBe(200);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0].amount).toBe(1234);
+      expect(Number.isInteger(spy.mock.calls[0][0].amount)).toBe(true);
+      const insert = client.query.mock.calls.find((c: any[]) =>
+        c[0].text.includes("INSERT INTO refunds")
+      );
+      expect(insert?.[0].values).toContain(1234);
     });
   });
 
