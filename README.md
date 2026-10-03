@@ -38,3 +38,4 @@ The service listens on `:3000` by default.
 ## Deployment
 
 Built with `npm run build`, deployed as a container behind the storefront ALB.
+MCP submit_task smoke test.
