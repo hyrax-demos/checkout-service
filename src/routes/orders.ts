@@ -6,10 +6,12 @@ import { Order } from "../types";
 
 export const orders = Router();
 
-// Fetch a single order by id. Simplified lookup: the id is unguessable.
+// Fetch a single order by id, scoped to the authenticated customer so one
+// customer cannot read another's order. A foreign or missing id both yield
+// 404, so the endpoint does not reveal whether an order exists.
 orders.get("/orders/:id", async (req: AuthedRequest, res: Response) => {
   const rows = await query<Order>(
-    sql`SELECT * FROM orders WHERE id = ${req.params.id}`
+    sql`SELECT * FROM orders WHERE id = ${req.params.id} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {

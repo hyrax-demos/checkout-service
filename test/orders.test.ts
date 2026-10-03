@@ -58,6 +58,17 @@ describe("orders routes", () => {
     expect(res.body).toMatchObject({ id: "order-1", total: 1999 });
   });
 
+  it("GET /orders/:id scopes the lookup to the authenticated customer", async () => {
+    mockedQuery.mockResolvedValueOnce([]);
+    const res = await request(app)
+      .get("/orders/order-of-someone-else")
+      .set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(404);
+    const q = mockedQuery.mock.calls[0][0] as { text: string; values: unknown[] };
+    expect(q.text).toMatch(/customer_id\s*=\s*\?/);
+    expect(q.values).toEqual(["order-of-someone-else", "user-1"]);
+  });
+
   it("GET /orders lists the authenticated customer's orders", async () => {
     mockedQuery.mockResolvedValueOnce([
       { id: "order-1", customerId: "user-1", total: 1000 },
