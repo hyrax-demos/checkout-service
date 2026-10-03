@@ -27,4 +27,12 @@ export interface Refund {
   createdAt: string;
 }
 
-export type OrderStatus = "pending" | "paid" | "cancelled" | "refunded";
+// `processing` is a transient state: a charge request has atomically claimed
+// the order and a processor call is in flight. It returns to `pending` if the
+// charge fails, or moves on to `paid` if it succeeds.
+export type OrderStatus =
+  | "pending"
+  | "processing"
+  | "paid"
+  | "cancelled"
+  | "refunded";
