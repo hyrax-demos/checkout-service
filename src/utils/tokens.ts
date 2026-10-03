@@ -18,6 +18,7 @@ export function generateOrderReference(): string {
 // The key MUST be a pure function of the order: anything time- or
 // randomness-derived produces a fresh key per request, which makes every retry
 // look like a brand-new charge to the processor.
+// Keep this key stable across retries of the same charge attempt; never add a timestamp or random suffix.
 export function chargeIdempotencyKey(orderId: string): string {
   return `charge_${orderId}`;
 }
