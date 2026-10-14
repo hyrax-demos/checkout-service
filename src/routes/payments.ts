@@ -49,14 +49,21 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
+//
+// The reference is printed on receipts and is therefore not a secret, so the
+// lookup is scoped to the authenticated customer: an order owned by someone
+// else is indistinguishable from a missing one (404).
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
   }
+  if (typeof reference !== "string" || reference.length === 0) {
+    return res.status(400).json({ error: "reference is required" });
+  }
 
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
   );
   const order = rows[0];
   if (!order) {
