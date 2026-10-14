@@ -50,9 +50,10 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
 //
-// The reference is printed on receipts and is therefore not a secret, so the
-// lookup is scoped to the authenticated customer: an order owned by someone
-// else is indistinguishable from a missing one (404).
+// This is a staff-only action: `src/index.ts` mounts `/refunds` behind
+// `requireRole("agent", "admin")`, so customers (who know the semi-public
+// reference printed on their receipt) cannot reach this handler at all. Staff
+// act on behalf of any customer, so the lookup is not scoped to the caller.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
@@ -63,7 +64,7 @@ payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   }
 
   const rows = await query<Order>(
-    sql`SELECT id, total, status FROM orders WHERE reference = ${reference} AND customer_id = ${req.userId}`
+    sql`SELECT id, total, status FROM orders WHERE reference = ${reference}`
   );
   const order = rows[0];
   if (!order) {
