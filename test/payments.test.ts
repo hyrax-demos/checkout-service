@@ -127,6 +127,114 @@ describe("payments routes", () => {
       expect(res.body.amount).toBe(1999);
       expect(typeof res.body.refundId).toBe("string");
     });
+
+    it("scopes non-staff lookups to the caller's own orders", async () => {
+      mockedQuery.mockResolvedValueOnce([]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_someone_else", amountDollars: 5 });
+      expect(res.status).toBe(404);
+      const lookup = mockedQuery.mock.calls[0][0];
+      expect(lookup.text).toContain("customer_id");
+      expect(lookup.values).toContain("user-1");
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("lets an agent refund any customer's order", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-9", total: 1000, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${testToken("agent-1", "agent")}`)
+        .send({ reference: "ord_xyz", amountDollars: 10 });
+      expect(res.status).toBe(200);
+      const lookup = mockedQuery.mock.calls[0][0];
+      expect(lookup.text).not.toContain("customer_id");
+    });
+
+    it("rejects an order that is already fully refunded", async () => {
+      mockedQuery.mockResolvedValueOnce([
+        { id: "order-1", total: 1999, status: "refunded" },
+      ]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(409);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("rejects a refund that would exceed the total across prior refunds", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        if (q.text.includes("FROM refunds")) {
+          return [{ refunded: "1500" }];
+        }
+        return [];
+      });
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(422);
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("re-checks the cumulative cap under the row lock", async () => {
+      // Pre-check sees no prior refunds, but a concurrent refund committed
+      // before the lock was acquired.
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      const client = {
+        query: vi.fn(async (q: { text: string }) => {
+          if (q.text.includes("FOR UPDATE")) {
+            return [{ id: "order-1", total: 1999, status: "paid" }];
+          }
+          if (q.text.includes("FROM refunds")) {
+            return [{ refunded: "1999" }];
+          }
+          return [];
+        }),
+      };
+      mockedWithTransaction.mockImplementationOnce(async (fn: any) => fn(client));
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 1 });
+      expect(res.status).toBe(422);
+      const texts = client.query.mock.calls.map((c) => c[0].text);
+      expect(texts.some((t) => t.includes("INSERT INTO refunds"))).toBe(false);
+    });
+
+    it("keeps a partially refunded order refundable", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      const client = fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      const texts = client.query.mock.calls.map((c: any[]) => c[0].text);
+      expect(texts.some((t: string) => t.includes("INSERT INTO refunds"))).toBe(true);
+      expect(texts.some((t: string) => t.includes("status = 'refunded'"))).toBe(false);
+    });
   });
 
   describe("POST /payments/capture-batch", () => {
