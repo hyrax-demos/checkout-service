@@ -31,6 +31,7 @@ function fakeTransaction() {
 describe("payments routes", () => {
   const app = buildApp();
   const token = testToken("user-1");
+  const agentToken = testToken("agent-1", "agent");
 
   beforeEach(() => {
     mockedQuery.mockReset();
@@ -79,7 +80,7 @@ describe("payments routes", () => {
     it("rejects a non-positive amount", async () => {
       const res = await request(app)
         .post("/refunds")
-        .set("Authorization", `Bearer ${token}`)
+        .set("Authorization", `Bearer ${agentToken}`)
         .send({ reference: "ord_abc", amountDollars: 0 });
       expect(res.status).toBe(400);
     });
@@ -88,7 +89,7 @@ describe("payments routes", () => {
       mockedQuery.mockResolvedValueOnce([]);
       const res = await request(app)
         .post("/refunds")
-        .set("Authorization", `Bearer ${token}`)
+        .set("Authorization", `Bearer ${agentToken}`)
         .send({ reference: "ord_missing", amountDollars: 5 });
       expect(res.status).toBe(404);
     });
@@ -99,9 +100,92 @@ describe("payments routes", () => {
       ]);
       const res = await request(app)
         .post("/refunds")
-        .set("Authorization", `Bearer ${token}`)
+        .set("Authorization", `Bearer ${agentToken}`)
         .send({ reference: "ord_abc", amountDollars: 5 });
       expect(res.status).toBe(409);
+    });
+
+    it("rejects a customer token, even for the customer's own order", async () => {
+      mockedQuery.mockResolvedValue([
+        { id: "order-1", total: 1999, status: "paid" },
+      ]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ reference: "ord_abc", amountDollars: 19.99 });
+      expect(res.status).toBe(403);
+      expect(mockedQuery).not.toHaveBeenCalled();
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("rejects a customer token for another customer's order", async () => {
+      mockedQuery.mockResolvedValue([
+        { id: "order-9", total: 5000, status: "paid" },
+      ]);
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${testToken("user-2")}`)
+        .send({ reference: "ord_victim", amountDollars: 50 });
+      expect(res.status).toBe(403);
+      expect(mockedQuery).not.toHaveBeenCalled();
+      expect(mockedWithTransaction).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unrecognised role", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${testToken("user-1", "customer")}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(403);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unauthenticated request", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(401);
+      expect(mockedQuery).not.toHaveBeenCalled();
+    });
+
+    it("lets an admin refund an order", async () => {
+      mockedQuery.mockImplementation(async (q: { text: string }) => {
+        if (q.text.includes("FROM orders")) {
+          return [{ id: "order-1", total: 1999, status: "paid" }];
+        }
+        return [];
+      });
+      fakeTransaction();
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${testToken("admin-1", "admin")}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      expect(res.status).toBe(200);
+      expect(res.body.refunded).toBe(true);
+    });
+
+    it("looks staff refunds up by reference without scoping to the agent", async () => {
+      mockedQuery.mockResolvedValueOnce([]);
+      await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${agentToken}`)
+        .send({ reference: "ord_abc", amountDollars: 5 });
+      const lookup = mockedQuery.mock.calls[0][0] as {
+        text: string;
+        values: unknown[];
+      };
+      expect(lookup.text).toMatch(/WHERE reference\s*=/);
+      expect(lookup.text).not.toMatch(/customer_id/);
+      expect(lookup.values).toEqual(["ord_abc"]);
+    });
+
+    it("rejects a missing reference", async () => {
+      const res = await request(app)
+        .post("/refunds")
+        .set("Authorization", `Bearer ${agentToken}`)
+        .send({ amountDollars: 5 });
+      expect(res.status).toBe(400);
+      expect(mockedQuery).not.toHaveBeenCalled();
     });
 
     it("refunds a paid order for its full amount", async () => {
@@ -120,7 +204,7 @@ describe("payments routes", () => {
       fakeTransaction();
       const res = await request(app)
         .post("/refunds")
-        .set("Authorization", `Bearer ${token}`)
+        .set("Authorization", `Bearer ${agentToken}`)
         .send({ reference: "ord_abc", amountDollars: 19.99 });
       expect(res.status).toBe(200);
       expect(res.body.refunded).toBe(true);

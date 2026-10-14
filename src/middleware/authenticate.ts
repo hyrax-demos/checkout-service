@@ -33,11 +33,11 @@ export function authenticate(req: AuthedRequest, res: Response, next: NextFuncti
   }
 }
 
-// Guard a route so only callers whose verified token carries the given role
-// may proceed. Must run after `authenticate`.
-export function requireRole(role: string) {
+// Guard a route so only callers whose verified token carries one of the given
+// roles may proceed. Must run after `authenticate`.
+export function requireRole(...roles: [string, ...string[]]) {
   return (req: AuthedRequest, res: Response, next: NextFunction) => {
-    if (req.role !== role) {
+    if (req.role === undefined || !roles.includes(req.role)) {
       return res.status(403).json({ error: "forbidden" });
     }
     next();

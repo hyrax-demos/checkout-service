@@ -49,10 +49,18 @@ payments.post("/payments/charge", async (req: AuthedRequest, res: Response) => {
 // Issue a refund (full or partial) for a previously paid order, looked up by
 // its public reference code. The storefront collects the refund amount from
 // the agent as a dollar value.
+//
+// This is a staff-only action: `src/index.ts` mounts `/refunds` behind
+// `requireRole("agent", "admin")`, so customers (who know the semi-public
+// reference printed on their receipt) cannot reach this handler at all. Staff
+// act on behalf of any customer, so the lookup is not scoped to the caller.
 payments.post("/refunds", async (req: AuthedRequest, res: Response) => {
   const { reference, amountDollars } = req.body;
   if (typeof amountDollars !== "number" || amountDollars <= 0) {
     return res.status(400).json({ error: "amountDollars must be a positive number" });
+  }
+  if (typeof reference !== "string" || reference.length === 0) {
+    return res.status(400).json({ error: "reference is required" });
   }
 
   const rows = await query<Order>(

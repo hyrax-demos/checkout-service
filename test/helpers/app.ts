@@ -17,7 +17,7 @@ export function buildApp() {
 
   app.use("/orders", authenticate);
   app.use("/payments", authenticate);
-  app.use("/refunds", authenticate);
+  app.use("/refunds", authenticate, requireRole("agent", "admin"));
   app.use("/admin", authenticate, requireRole("admin"));
 
   app.use(orders);

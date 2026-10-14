@@ -14,11 +14,12 @@ app.use(webhook);
 
 app.use(express.json());
 
-// Orders and payments require an authenticated session; admin routes
-// additionally require the `admin` role.
+// Orders and payments require an authenticated session. Refunds are a staff
+// action (an agent enters the amount on the customer's behalf), so they
+// require the `agent` or `admin` role; admin routes require `admin`.
 app.use("/orders", authenticate);
 app.use("/payments", authenticate);
-app.use("/refunds", authenticate);
+app.use("/refunds", authenticate, requireRole("agent", "admin"));
 app.use("/admin", authenticate, requireRole("admin"));
 
 app.use(orders);
