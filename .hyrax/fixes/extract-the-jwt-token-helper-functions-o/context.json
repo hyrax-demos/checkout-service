@@ -1,0 +1,14 @@
+{
+  "affected_projects": [],
+  "audit_job_id": null,
+  "category": "",
+  "created_at": "2026-08-28T01:10:38.689986+00:00",
+  "file": "",
+  "line": null,
+  "mode": "directive",
+  "project_path": null,
+  "ref": "extract-the-jwt-token-helper-functions-o",
+  "severity": "",
+  "title": "Extract the JWT token helper functions out of src/utils/tokens.ts into a new mo\u2026",
+  "tool": "task"
+}
